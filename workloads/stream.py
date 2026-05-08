@@ -135,18 +135,15 @@ class StreamBench(BaseWorkload):
         import subprocess
         import tempfile
         import urllib.request
+        from benchmark_toolkit.sysutils import PackageInstaller
 
         target = os.path.join(install_dir, "stream_omp")
         if not force and _find_stream_binary(install_dir):
             return True, f"Already installed: {_find_stream_binary(install_dir)}"
 
-        if not shutil.which("gcc"):
-            return (
-                False,
-                "gcc not found. Install build tools first:\n"
-                "  Ubuntu/Debian: sudo apt install build-essential\n"
-                "  RHEL/CentOS:   sudo yum groupinstall 'Development Tools'",
-            )
+        ok, msg = PackageInstaller.ensure_tools(("gcc", "gcc"))
+        if not ok:
+            return False, f"gcc unavailable: {msg}"
 
         array_size = _detect_stream_array_size()
         url = "https://www.cs.virginia.edu/stream/FTP/Code/stream.c"

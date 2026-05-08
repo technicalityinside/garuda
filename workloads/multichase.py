@@ -179,6 +179,7 @@ class MultichaseBench(BaseWorkload):
         import subprocess
         import tempfile
         import urllib.request
+        from benchmark_toolkit.sysutils import PackageInstaller
 
         target = os.path.join(install_dir, "multichase")
         if not force and (_shutil.which("multichase") or
@@ -188,6 +189,15 @@ class MultichaseBench(BaseWorkload):
 
         os.makedirs(install_dir, exist_ok=True)
 
+        # Ensure compiler and build tools are present
+        ok, msg = PackageInstaller.ensure_tools(
+            ("gcc",  "gcc"),
+            ("make", "make"),
+        )
+        if not ok:
+            return False, f"Build tools unavailable: {msg}"
+
+        # Prefer git; fall back to downloading a tarball if git is absent
         with tempfile.TemporaryDirectory() as tmpdir:
             src_dir = os.path.join(tmpdir, "multichase")
 
@@ -201,21 +211,36 @@ class MultichaseBench(BaseWorkload):
                 if r.returncode != 0:
                     return False, f"git clone failed:\n{r.stderr}"
             else:
-                archive_url = (
-                    "https://github.com/google/multichase/archive"
-                    "/refs/heads/master.tar.gz"
-                )
-                print(f"  git not found — downloading archive from {archive_url} ...")
-                archive = os.path.join(tmpdir, "multichase.tar.gz")
-                try:
-                    urllib.request.urlretrieve(archive_url, archive)
-                except Exception as exc:
-                    return False, f"Download failed: {exc}"
-                subprocess.run(["tar", "xzf", archive, "-C", tmpdir], check=True)
-                extracted = os.path.join(tmpdir, "multichase-master")
-                if not os.path.isdir(extracted):
-                    return False, "Could not extract archive"
-                os.rename(extracted, src_dir)
+                # Try to install git first
+                print("  git not found — attempting to install ...")
+                PackageInstaller.install("git")
+
+                if _shutil.which("git"):
+                    url = "https://github.com/google/multichase"
+                    print(f"  Cloning {url} ...")
+                    r = subprocess.run(
+                        ["git", "clone", "--depth=1", url, src_dir],
+                        capture_output=True, text=True,
+                    )
+                    if r.returncode != 0:
+                        return False, f"git clone failed:\n{r.stderr}"
+                else:
+                    # Last resort: download archive
+                    archive_url = (
+                        "https://github.com/google/multichase/archive"
+                        "/refs/heads/master.tar.gz"
+                    )
+                    print(f"  Falling back to archive download from {archive_url} ...")
+                    archive = os.path.join(tmpdir, "multichase.tar.gz")
+                    try:
+                        urllib.request.urlretrieve(archive_url, archive)
+                    except Exception as exc:
+                        return False, f"Download failed: {exc}"
+                    subprocess.run(["tar", "xzf", archive, "-C", tmpdir], check=True)
+                    extracted = os.path.join(tmpdir, "multichase-master")
+                    if not os.path.isdir(extracted):
+                        return False, "Could not extract archive"
+                    os.rename(extracted, src_dir)
 
             nproc = os.cpu_count() or 4
             print(f"  Building (make -j{nproc}) ...")
