@@ -103,6 +103,36 @@ class FioBench(BaseWorkload):
 
         return metrics
 
+    def install(self, install_dir: str, force: bool = False) -> Tuple[bool, str]:
+        import subprocess
+        if not force and shutil.which("fio"):
+            return True, f"Already installed: {shutil.which('fio')}"
+        for pm, cmd in [
+            ("apt-get", ["sudo", "apt-get", "install", "-y", "fio"]),
+            ("apt",     ["sudo", "apt",     "install", "-y", "fio"]),
+            ("yum",     ["sudo", "yum",     "install", "-y", "fio"]),
+            ("dnf",     ["sudo", "dnf",     "install", "-y", "fio"]),
+            ("pacman",  ["sudo", "pacman",  "-S", "--noconfirm", "fio"]),
+            ("zypper",  ["sudo", "zypper",  "install", "-y", "fio"]),
+        ]:
+            if shutil.which(pm):
+                print(f"  Installing via {pm} ...")
+                result = subprocess.run(cmd)
+                if result.returncode == 0 and shutil.which("fio"):
+                    return True, f"Installed via {pm}: {shutil.which('fio')}"
+                return False, f"{pm} install failed (exit {result.returncode})"
+        return (
+            False,
+            "No supported package manager found. Install manually:\n"
+            "  Ubuntu/Debian: sudo apt install fio\n"
+            "  RHEL/CentOS:   sudo yum install fio\n"
+            "  Source:        https://github.com/axboe/fio",
+        )
+
+    @property
+    def install_hint(self) -> str:
+        return "package manager (apt/yum/dnf)"
+
     def default_workload_args(self) -> Dict:
         return {
             "name": "benchmark",

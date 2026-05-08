@@ -64,6 +64,23 @@ class BaseWorkload(ABC):
         """
         pass
 
+    def install(self, install_dir: str, force: bool = False) -> Tuple[bool, str]:
+        """
+        Optional: download, build, and install the workload binary to install_dir.
+
+        install_dir is created by the caller before this method is invoked.
+        force=True means reinstall even if the binary is already present.
+        Implementations may print progress lines to stdout.
+
+        Returns (success, message).  Default: not supported.
+        """
+        return False, f"No automated install available for {self.name!r}."
+
+    @property
+    def install_hint(self) -> str:
+        """One-line description of how this workload is installed."""
+        return "no automated install"
+
     def default_workload_args(self) -> Dict:
         """
         Default workload-specific arguments.

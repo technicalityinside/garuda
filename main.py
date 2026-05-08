@@ -30,12 +30,19 @@ from benchmark_toolkit.collector import ResultsCollector, _print_table
 from benchmark_toolkit.scaling import ScalingStudy
 
 WORKLOADS_DIR = os.path.join(_ROOT, "workloads")
-RESULTS_DIR = os.path.join(_ROOT, "results")
+RESULTS_DIR   = os.path.join(_ROOT, "results")
+BIN_DIR       = os.path.join(_ROOT, "bin")
 
 
 def _discover_workloads():
     """Import workloads directory and register all workloads."""
     registry.discover(WORKLOADS_DIR)
+
+
+def _prepend_bin_dir():
+    """Add the local bin/ directory to PATH so locally installed binaries are found."""
+    if os.path.isdir(BIN_DIR):
+        os.environ["PATH"] = BIN_DIR + os.pathsep + os.environ.get("PATH", "")
 
 
 def _get_topology():
@@ -134,11 +141,12 @@ def cmd_run(args, topo):
         print(f"Error: {e}")
         sys.exit(1)
 
-    # Validate unless --skip-validate
-    ok, msg = workload.validate()
-    if not ok:
-        print(f"Validation failed for {args.workload}: {msg}")
-        sys.exit(1)
+    # Skip validation for dry-run (binary may not be installed on this machine)
+    if not args.dry_run:
+        ok, msg = workload.validate()
+        if not ok:
+            print(f"Validation failed for {args.workload}: {msg}")
+            sys.exit(1)
 
     # Build config
     workload_args = _parse_workload_args(args.arg)
@@ -173,6 +181,7 @@ def cmd_run(args, topo):
         work_dir=args.work_dir,
         dry_run=args.dry_run,
         verbose=args.verbose,
+        bin_dir=BIN_DIR,
     )
     collector = ResultsCollector(results_dir=RESULTS_DIR)
 
@@ -226,7 +235,7 @@ def cmd_scaling(args, topo):
         print(f"Error: {e}")
         sys.exit(1)
 
-    ok, msg = workload.validate()
+    ok, msg = (True, "") if args.dry_run else workload.validate()
     if not ok:
         print(f"Validation failed for {args.workload}: {msg}")
         sys.exit(1)
@@ -237,6 +246,7 @@ def cmd_scaling(args, topo):
         work_dir=args.work_dir,
         dry_run=args.dry_run,
         verbose=args.verbose,
+        bin_dir=BIN_DIR,
     )
     collector = ResultsCollector(results_dir=RESULTS_DIR)
     study = ScalingStudy(runner=runner, collector=collector, topology=topo)
@@ -300,6 +310,69 @@ def cmd_scaling(args, topo):
         print(f"\nStudy ID: {study_id}")
         study.print_scaling_table(study_id)
         print(f"\nResults saved to: {RESULTS_DIR}/{study_id}/")
+
+
+def cmd_setup(args, topo):
+    """Download, build, and install benchmark binaries."""
+    install_dir = args.install_dir or BIN_DIR
+    os.makedirs(install_dir, exist_ok=True)
+
+    names = (
+        [args.workload]
+        if args.workload
+        else [w["name"] for w in registry.list_all()]
+    )
+
+    # ── status-only listing ──────────────────────────────────────────────────
+    if args.list:
+        print(f"\nWorkload setup status  (local bin dir: {install_dir})\n")
+        rows = []
+        for name in names:
+            try:
+                wl = registry.get(name)
+                ok, msg = wl.validate()
+                rows.append([name, "OK" if ok else "MISSING",
+                              wl.install_hint, msg])
+            except KeyError as exc:
+                rows.append([name, "ERROR", "?", str(exc)])
+        _print_simple_table(["Workload", "Status", "Install method", "Message"], rows)
+        return
+
+    # ── install ──────────────────────────────────────────────────────────────
+    all_ok = True
+    for name in names:
+        try:
+            wl = registry.get(name)
+        except KeyError as exc:
+            print(f"\n[ERROR] Unknown workload: {exc}")
+            all_ok = False
+            continue
+
+        ok, msg = wl.validate()
+        print(f"\nSetup: {wl.name}  [{wl.install_hint}]")
+        print(f"  Status : {'OK' if ok else 'MISSING'} — {msg}")
+
+        if ok and not args.force:
+            print("  Skipping (already installed). Use --force to reinstall.")
+            continue
+
+        if wl.install_hint == "no install needed":
+            print("  Nothing to install.")
+            continue
+
+        print(f"  Target : {install_dir}")
+        install_ok, install_msg = wl.install(install_dir, force=args.force)
+        if install_ok:
+            print(f"  [OK]     {install_msg}")
+        else:
+            print(f"  [FAILED] {install_msg}")
+            all_ok = False
+
+    print()
+    if all_ok:
+        print("Run 'python3 main.py validate' to confirm all workloads are ready.")
+    else:
+        sys.exit(1)
 
 
 def cmd_report(args, topo):
@@ -429,6 +502,10 @@ def build_parser() -> argparse.ArgumentParser:
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Examples:
+              python main.py setup --list
+              python main.py setup --workload multichase
+              python main.py setup --workload stream --install-dir ./bin
+              python main.py setup                        # install all missing workloads
               python main.py list-workloads
               python main.py list-configs
               python main.py validate
@@ -451,6 +528,27 @@ def build_parser() -> argparse.ArgumentParser:
 
     subparsers = parser.add_subparsers(dest="command", metavar="COMMAND")
     subparsers.required = True
+
+    # setup
+    p_setup = subparsers.add_parser(
+        "setup", help="Download, build, and install benchmark binaries"
+    )
+    p_setup.add_argument(
+        "--workload", metavar="NAME",
+        help="Install a specific workload only (default: all missing workloads)",
+    )
+    p_setup.add_argument(
+        "--install-dir", metavar="DIR",
+        help=f"Directory for compiled/installed binaries (default: {BIN_DIR})",
+    )
+    p_setup.add_argument(
+        "--force", action="store_true",
+        help="Reinstall even if the binary is already present",
+    )
+    p_setup.add_argument(
+        "--list", action="store_true",
+        help="Show install status and methods without installing anything",
+    )
 
     # list-workloads
     subparsers.add_parser("list-workloads", help="List all discovered workloads")
@@ -539,6 +637,9 @@ def main():
     if not hasattr(args, "work_dir") or args.work_dir is None:
         args.work_dir = "/tmp/benchmark_toolkit"
 
+    # Prepend local bin/ to PATH so locally installed binaries are found by validate()
+    _prepend_bin_dir()
+
     # Discover workloads
     _discover_workloads()
 
@@ -561,6 +662,7 @@ def main():
         )
 
     dispatch = {
+        "setup": cmd_setup,
         "list-workloads": cmd_list_workloads,
         "list-configs": cmd_list_configs,
         "validate": cmd_validate,

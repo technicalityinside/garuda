@@ -103,6 +103,10 @@ class PythonBench(BaseWorkload):
     def validate(self) -> Tuple[bool, str]:
         return True, "No external dependencies required"
 
+    @property
+    def install_hint(self) -> str:
+        return "no install needed"
+
     def setup(self, config: BenchmarkConfig, work_dir: str) -> None:
         """Write the worker script to work_dir."""
         os.makedirs(work_dir, exist_ok=True)

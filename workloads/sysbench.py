@@ -90,6 +90,36 @@ class SysbenchCPU(BaseWorkload):
                     pass
         return metrics
 
+    def install(self, install_dir: str, force: bool = False) -> Tuple[bool, str]:
+        import subprocess
+        if not force and shutil.which("sysbench"):
+            return True, f"Already installed: {shutil.which('sysbench')}"
+        for pm, cmd in [
+            ("apt-get", ["sudo", "apt-get", "install", "-y", "sysbench"]),
+            ("apt",     ["sudo", "apt",     "install", "-y", "sysbench"]),
+            ("yum",     ["sudo", "yum",     "install", "-y", "sysbench"]),
+            ("dnf",     ["sudo", "dnf",     "install", "-y", "sysbench"]),
+            ("pacman",  ["sudo", "pacman",  "-S", "--noconfirm", "sysbench"]),
+            ("zypper",  ["sudo", "zypper",  "install", "-y", "sysbench"]),
+        ]:
+            if shutil.which(pm):
+                print(f"  Installing via {pm} ...")
+                result = subprocess.run(cmd)
+                if result.returncode == 0 and shutil.which("sysbench"):
+                    return True, f"Installed via {pm}: {shutil.which('sysbench')}"
+                return False, f"{pm} install failed (exit {result.returncode})"
+        return (
+            False,
+            "No supported package manager found. Install manually:\n"
+            "  Ubuntu/Debian: sudo apt install sysbench\n"
+            "  RHEL/CentOS:   sudo yum install sysbench\n"
+            "  Source:        https://github.com/akopytov/sysbench",
+        )
+
+    @property
+    def install_hint(self) -> str:
+        return "package manager (apt/yum/dnf)"
+
     def default_workload_args(self) -> Dict:
         return {
             "prime": 20000,

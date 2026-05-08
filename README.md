@@ -47,23 +47,26 @@ tools/
 ## Quick Start
 
 ```bash
-# See what's available
-python3 main.py list-workloads
-python3 main.py list-configs
+# 1. Check what's installed and what needs setup
+python3 main.py setup --list
 
-# Check which workloads are ready to run
+# 2. Install all missing workloads (or just one)
+python3 main.py setup
+python3 main.py setup --workload multichase
+
+# 3. Confirm everything is ready
 python3 main.py validate
 
-# Run the built-in Python benchmark on all physical cores
+# 4. Run the built-in Python benchmark on all physical cores
 python3 main.py run --workload python_bench --config full_socket --iterations 3
 
-# Run a scaling study
+# 5. Run a scaling study
 python3 main.py scaling --workload python_bench --mode powers_of_2
 
-# Compare SMT vs physical cores
+# 6. Compare SMT vs physical cores
 python3 main.py scaling --workload python_bench --configs 1c1t,1c2t,2c2t,2c4t
 
-# List and inspect saved results
+# 7. List and inspect saved results
 python3 main.py report --list
 python3 main.py report --run-id <run_id>
 ```
@@ -79,6 +82,56 @@ python3 main.py [--work-dir DIR] COMMAND [options]
 ```
 
 `--work-dir` (default: `/tmp/benchmark_toolkit`) is where temporary files such as worker scripts are written.
+
+---
+
+### `setup`
+
+Download, build, and install benchmark binaries into the local `bin/` directory. Once installed, binaries are found automatically by `validate` and `run` without any PATH changes needed.
+
+```bash
+python3 main.py setup [--workload NAME] [--install-dir DIR] [--force] [--list]
+```
+
+| Flag | Description |
+|---|---|
+| `--list` | Show install status and method for each workload — no changes made |
+| `--workload NAME` | Install a specific workload only (default: all missing workloads) |
+| `--install-dir DIR` | Where to write compiled binaries (default: `bin/` inside the toolkit root) |
+| `--force` | Reinstall even if the binary is already present |
+
+**Examples:**
+
+```bash
+# Show current status without installing anything
+python3 main.py setup --list
+
+# Install all workloads that are missing
+python3 main.py setup
+
+# Install only multichase
+python3 main.py setup --workload multichase
+
+# Recompile stream with a fresh download
+python3 main.py setup --workload stream --force
+
+# Install to a custom directory
+python3 main.py setup --workload stream --install-dir /opt/benchmarks/bin
+```
+
+**What each workload does:**
+
+| Workload | Install method | Requirements |
+|---|---|---|
+| `python_bench` | No install needed | Python only |
+| `sysbench_cpu` | Package manager (`apt`/`yum`/`dnf`/`pacman`) | `sudo` |
+| `stream` | Download `stream.c` + compile with `gcc -fopenmp` | `gcc`, internet |
+| `fio` | Package manager (`apt`/`yum`/`dnf`/`pacman`) | `sudo` |
+| `multichase` | `git clone` + `make` | `git`, `make`, `gcc`, internet |
+
+The `STREAM_ARRAY_SIZE` is auto-detected from the system's L3 cache size (targeting 4× L3) so the arrays always fit in DRAM during the benchmark.
+
+Binaries land in `bin/` (relative to `main.py`). This directory is prepended to `PATH` at startup, so `validate` and `run` find them without any shell configuration.
 
 ---
 
@@ -374,6 +427,56 @@ python3 main.py run --workload stream --config 16c16t --arg array_size=200000000
 
 ---
 
+### `multichase` — Memory Latency (Pointer Chasing)
+
+**Dependencies:** `multichase` binary in PATH
+
+Build from source:
+
+```bash
+git clone https://github.com/google/multichase
+cd multichase && make
+sudo cp multichase /usr/local/bin/
+```
+
+Runs pointer-chasing loops across a configurable list of arena sizes. Each arena is measured independently; the results form a latency-vs-memory-level profile showing L1, L2, L3, and DRAM latency in a single run.
+
+```bash
+# Full cache hierarchy sweep on one physical core
+python3 main.py run --workload multichase --config 1c1t
+
+# DRAM latency scaling study — how latency changes as threads compete for memory
+python3 main.py scaling --workload multichase --configs 1c1t,2c2t,4c4t,8c8t,16c16t \
+    --arg arena=256m
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `arena` | `64k,512k,4m,32m,128m,256m` | Comma-separated arena sizes (k/m/g suffix). Covers L1→DRAM on typical x86. |
+| `samples` | `6` | Samples per arena size (each = 0.5 s; default = 3 s per arena) |
+| `stride` | `256` | Stride between pointers in bytes |
+| `mode` | `simple` | Chase mode: `simple`, `parallel2`–`parallel10`, `work:N`, `incr`, `branch` |
+| `average` | `false` | `true` → report average latency; `false` → report best (minimum) latency |
+| `hugepages` | `false` | Use transparent hugepages (`-H` flag) |
+
+```bash
+# Single DRAM measurement only (faster; useful for scaling studies)
+python3 main.py run --workload multichase --config 4c4t --arg arena=256m samples=10
+
+# Parallel chase mode — multiple independent pointer chains per thread
+python3 main.py run --workload multichase --config 1c1t --arg mode=parallel4
+
+# Custom arena sweep targeting this machine's cache hierarchy
+python3 main.py run --workload multichase --config 1c1t \
+    --arg arena=32k,512k,1m,8m,32m,64m,256m
+```
+
+**Metrics:** `latency_<size>_ns` for each arena (e.g. `latency_64k_ns`, `latency_256m_ns`), plus `latency_min_ns` (≈ L1 latency) and `latency_max_ns` (≈ DRAM latency).
+
+For scaling studies, specify a single arena size with `--arg arena=256m` so the primary metric `latency_256m_ns` is comparable across all configs.
+
+---
+
 ### `fio` — FIO I/O Benchmark
 
 **Dependencies:** `apt install fio` / `yum install fio`
@@ -520,12 +623,14 @@ python3 main.py scaling --workload my_bench --configs 1c1t,2c2t,4c4t,8c8t
 
 All methods in `BaseWorkload` (`benchmark_toolkit/base.py`):
 
-| Method | Required | Description |
+| Method / property | Required | Description |
 |---|---|---|
 | `validate()` | Yes | Return `(bool, str)`. Check that required binaries exist. |
 | `build_command(config)` | Yes | Return `argv` list. Do not include `taskset`/`numactl`; the runner prepends those. |
 | `parse_output(stdout, stderr, returncode)` | Yes | Return `{metric: float}`. Empty dict marks the run as failed. |
-| `setup(config, work_dir)` | No | Runs once before the first iteration. Compile, download data, write helper scripts, etc. |
+| `install(install_dir, force=False)` | No | Download/build/install the binary to `install_dir`. May print progress. Return `(bool, str)`. Default: "not supported". |
+| `install_hint` | No | Property: one-line description of the install method shown in `setup --list`. |
+| `setup(config, work_dir)` | No | Runs once before the first iteration. Write helper scripts, etc. |
 | `teardown(config, work_dir)` | No | Runs once after the last iteration. Clean up temp files. |
 | `get_env(config)` | No | Return env var overrides merged on top of `os.environ`. Default sets `OMP_NUM_THREADS`. |
 | `default_workload_args()` | No | Return default `{key: value}` dict. Merged with (and overridden by) `config.workload_args`. |

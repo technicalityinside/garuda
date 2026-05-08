@@ -38,10 +38,12 @@ class BenchmarkRunner:
         work_dir: str = "/tmp/benchmark_toolkit",
         dry_run: bool = False,
         verbose: bool = False,
+        bin_dir: Optional[str] = None,
     ):
         self.work_dir = work_dir
         self.dry_run = dry_run
         self.verbose = verbose
+        self.bin_dir = bin_dir  # prepended to PATH for every subprocess
 
     def run(
         self, workload: BaseWorkload, config: BenchmarkConfig
@@ -113,6 +115,8 @@ class BenchmarkRunner:
             ] + cmd
 
         env = {**os.environ, **workload.get_env(config)}
+        if self.bin_dir and os.path.isdir(self.bin_dir):
+            env["PATH"] = self.bin_dir + os.pathsep + env.get("PATH", "")
 
         if self.dry_run:
             print(f"[DRY RUN] {' '.join(cmd)}")
