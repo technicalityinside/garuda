@@ -9,6 +9,13 @@ Subcommands:
   run                     Run a workload with a given config
   scaling                 Run a scaling study
   report                  Show or export saved results
+
+Cloud orchestration:
+  cloud-run               Provision a VM, run benchmarks, fetch results, destroy VM
+  cloud-provision         Provision a cloud VM (tracked for later use)
+  cloud-exec              Run benchmarks on a previously provisioned VM
+  cloud-destroy           Destroy a tracked cloud VM
+  cloud-list              List tracked cloud VMs
 """
 
 import argparse
@@ -425,6 +432,195 @@ def cmd_report(args, topo):
         collector.print_summary(most_recent["run_id"])
 
 
+# ── Cloud orchestration helpers ──────────────────────────────────────────────
+
+def _build_vm_config(args):
+    from orchestrator.base import VMConfig
+    return VMConfig(
+        provider=args.provider,
+        region=args.region,
+        instance_type=args.instance_type,
+        image=getattr(args, 'image', None),
+        disk_size_gb=getattr(args, 'disk_size', 50),
+        ssh_user=getattr(args, 'ssh_user', 'ubuntu'),
+        ssh_key_path=getattr(args, 'ssh_key_path', '~/.ssh/id_rsa'),
+        ssh_key_name=getattr(args, 'aws_key_name', None),
+        vm_name=getattr(args, 'vm_name', None),
+        zone=getattr(args, 'gcp_zone', None),
+        resource_group=getattr(args, 'azure_resource_group', None),
+    )
+
+
+def _provider_kwargs(args) -> dict:
+    p = args.provider
+    if p == 'gcp':
+        return {'project': getattr(args, 'gcp_project', None)}
+    if p == 'azure':
+        return {'subscription': getattr(args, 'azure_subscription', None)}
+    if p == 'aws':
+        return {'profile': getattr(args, 'aws_profile', None)}
+    return {}
+
+
+def _build_bench_cmd(args) -> list:
+    """Construct the remote 'run' or 'scaling' command from CLI arguments."""
+    if getattr(args, 'scaling', False):
+        cmd = ['scaling', '--workload', args.workload]
+        if getattr(args, 'scaling_configs', None):
+            cmd += ['--configs', args.scaling_configs]
+        if getattr(args, 'scaling_mode', None):
+            cmd += ['--mode', args.scaling_mode]
+        if getattr(args, 'threads', None):
+            cmd += ['--threads', str(args.threads)]
+        if getattr(args, 'max_threads', None):
+            cmd += ['--max-threads', str(args.max_threads)]
+        if getattr(args, 'smt', False):
+            cmd += ['--smt']
+    else:
+        cmd = ['run', '--workload', args.workload]
+        if getattr(args, 'config', None):
+            cmd += ['--config', args.config]
+        elif getattr(args, 'threads', None):
+            cmd += ['--threads', str(args.threads)]
+
+    cmd += ['--iterations', str(getattr(args, 'iterations', 1))]
+
+    for kv in (getattr(args, 'arg', None) or []):
+        cmd += ['--arg', kv]
+
+    return cmd
+
+
+def cmd_cloud_run(args, topo):
+    """Provision a VM, run benchmarks, fetch results, then destroy."""
+    from orchestrator import get_provider
+    from orchestrator.runner import CloudBenchmarkRunner
+    from orchestrator.state import VMStateStore
+
+    vm_config = _build_vm_config(args)
+    provider = get_provider(args.provider, **_provider_kwargs(args))
+    runner = CloudBenchmarkRunner(provider)
+    store = VMStateStore()
+    bench_cmd = _build_bench_cmd(args)
+
+    def _on_provisioned(instance):
+        if args.no_teardown:
+            store.save(instance)
+
+    instance = None
+    try:
+        instance = runner.provision(vm_config, verbose=args.verbose)
+        _on_provisioned(instance)
+        runner.setup_toolkit(instance, _ROOT, args.verbose)
+        runner.run_setup(instance, args.workload, args.verbose)
+        runner.run_benchmark(instance, bench_cmd, args.verbose)
+        runner.fetch_results(instance, RESULTS_DIR)
+    except Exception as exc:
+        print(f"\n[cloud] Error: {exc}", file=sys.stderr)
+        if instance and not args.no_teardown:
+            print("[cloud] Attempting VM cleanup...", file=sys.stderr)
+            try:
+                runner.destroy(instance)
+            except Exception as exc2:
+                print(f"[cloud] Cleanup failed: {exc2}", file=sys.stderr)
+        sys.exit(1)
+
+    if args.no_teardown:
+        print(f"\n[cloud] VM kept running (use 'cloud-destroy --vm-name {instance.name}' to delete it).")
+    else:
+        runner.destroy(instance)
+        if args.no_teardown:
+            store.remove(instance.name)
+
+
+def cmd_cloud_provision(args, topo):
+    """Provision a cloud VM and save its info for later use."""
+    from orchestrator import get_provider
+    from orchestrator.runner import CloudBenchmarkRunner
+    from orchestrator.state import VMStateStore
+
+    vm_config = _build_vm_config(args)
+    provider = get_provider(args.provider, **_provider_kwargs(args))
+    runner = CloudBenchmarkRunner(provider)
+    store = VMStateStore()
+
+    instance = runner.provision(vm_config, verbose=getattr(args, 'verbose', False))
+    store.save(instance)
+
+    print(f"\nVM '{instance.name}' is ready.")
+    print(f"  Provider:  {instance.provider}")
+    print(f"  Type:      {instance.instance_type}")
+    print(f"  IP:        {instance.public_ip}")
+    print(f"  SSH:       ssh -i {instance.ssh_key_path} {instance.ssh_user}@{instance.public_ip}")
+    print(f"\n  Run bench: python3 main.py cloud-exec --vm-name {instance.name} --workload <name>")
+    print(f"  Destroy:   python3 main.py cloud-destroy --vm-name {instance.name}")
+
+
+def cmd_cloud_exec(args, topo):
+    """Run benchmarks on a previously provisioned VM."""
+    from orchestrator import get_provider
+    from orchestrator.runner import CloudBenchmarkRunner
+    from orchestrator.state import VMStateStore
+
+    store = VMStateStore()
+    instance = store.get(args.vm_name)
+    if instance is None:
+        print(f"Error: VM '{args.vm_name}' not found. Run 'cloud-list' to see tracked VMs.")
+        sys.exit(1)
+
+    provider = get_provider(instance.provider)
+    runner = CloudBenchmarkRunner(provider)
+    bench_cmd = _build_bench_cmd(args)
+
+    if not getattr(args, 'skip_setup', False):
+        runner.setup_toolkit(instance, _ROOT, getattr(args, 'verbose', False))
+        runner.run_setup(instance, args.workload, getattr(args, 'verbose', False))
+
+    rc = runner.run_benchmark(instance, bench_cmd, getattr(args, 'verbose', False))
+    runner.fetch_results(instance, RESULTS_DIR)
+    if rc != 0:
+        sys.exit(rc)
+
+
+def cmd_cloud_destroy(args, topo):
+    """Destroy a tracked cloud VM."""
+    from orchestrator import get_provider
+    from orchestrator.runner import CloudBenchmarkRunner
+    from orchestrator.state import VMStateStore
+
+    store = VMStateStore()
+    instance = store.get(args.vm_name)
+    if instance is None:
+        print(f"Error: VM '{args.vm_name}' not found in state. "
+              "It may already have been destroyed or was created with --no-teardown skipped.")
+        sys.exit(1)
+
+    provider = get_provider(instance.provider)
+    runner = CloudBenchmarkRunner(provider)
+    runner.destroy(instance)
+    store.remove(instance.name)
+    print(f"VM '{instance.name}' destroyed and removed from state.")
+
+
+def cmd_cloud_list(args, topo):
+    """List cloud VMs tracked by this toolkit."""
+    from orchestrator.state import VMStateStore
+
+    store = VMStateStore()
+    vms = store.list_all()
+    if not vms:
+        print("No tracked VMs. Use 'cloud-provision' or 'cloud-run --no-teardown' to create one.")
+        return
+
+    headers = ["Name", "Provider", "Type", "Region", "IP", "State"]
+    rows = [
+        [v.name, v.provider, v.instance_type, v.region, v.public_ip, v.state]
+        for v in vms
+    ]
+    _print_simple_table(headers, rows)
+    print(f"\n{len(vms)} tracked VM(s).  State shown is from provisioning time.")
+
+
 # ── Table printing helpers ──────────────────────────────────────────────────
 
 def _print_simple_table(headers: List[str], rows: List[List[str]]) -> None:
@@ -622,6 +818,143 @@ def build_parser() -> argparse.ArgumentParser:
     p_report.add_argument("--list", action="store_true", help="List all saved runs")
     p_report.add_argument("--csv", metavar="FILE", help="Export results to CSV file")
 
+    # ── Cloud orchestration subcommands ──────────────────────────────────────
+
+    def _add_vm_args(p):
+        """Attach common cloud VM arguments to a subparser."""
+        g = p.add_argument_group("VM configuration")
+        g.add_argument("--provider", required=True, choices=["gcp", "azure", "aws"],
+                       help="Cloud provider")
+        g.add_argument("--region", required=True,
+                       help="Region (e.g. us-central1, eastus, us-east-1)")
+        g.add_argument("--instance-type", required=True,
+                       help="Instance type (e.g. n2-standard-4, Standard_D4s_v3, m5.xlarge)")
+        g.add_argument("--ssh-key-path", default="~/.ssh/id_rsa", metavar="PATH",
+                       help="Local SSH private key (default: ~/.ssh/id_rsa)")
+        g.add_argument("--ssh-user", default="ubuntu", metavar="USER",
+                       help="SSH username on the VM (default: ubuntu)")
+        g.add_argument("--vm-name", metavar="NAME",
+                       help="Custom VM name (auto-generated if omitted)")
+        g.add_argument("--disk-size", type=int, default=50, metavar="GB",
+                       help="Boot disk size in GB (default: 50)")
+        g.add_argument("--image", metavar="IMAGE",
+                       help="OS image override (default: Ubuntu 22.04 LTS)")
+        g.add_argument("--gcp-zone",
+                       help="GCP zone override (default: {region}-a)")
+        g.add_argument("--gcp-project",
+                       help="GCP project ID (uses gcloud default if omitted)")
+        g.add_argument("--aws-key-name", metavar="KEYPAIR",
+                       help="AWS EC2 key-pair name (required for AWS)")
+        g.add_argument("--aws-profile",
+                       help="AWS CLI named profile")
+        g.add_argument("--azure-resource-group", metavar="RG",
+                       help="Azure resource group (auto-created if omitted)")
+        g.add_argument("--azure-subscription",
+                       help="Azure subscription ID")
+
+    def _add_bench_args(p, workload_required=True):
+        """Attach benchmark selection arguments to a subparser."""
+        g = p.add_argument_group("Benchmark")
+        g.add_argument("--workload", required=workload_required, metavar="NAME",
+                       help="Workload to run (see list-workloads)")
+        g.add_argument("--scaling", action="store_true",
+                       help="Run a scaling study instead of a single benchmark run")
+        g.add_argument("--config", metavar="PRESET",
+                       help="Config preset for single run (e.g. full_socket, 4c4t)")
+        g.add_argument("--threads", metavar="N",
+                       help="Thread count for single run, or comma-separated list for scaling")
+        g.add_argument("--iterations", type=int, default=1, metavar="N",
+                       help="Iterations per config (default: 1)")
+        g.add_argument("--scaling-configs", metavar="1c1t,2c2t,...",
+                       help="Named config presets for scaling study")
+        g.add_argument("--scaling-mode", choices=["powers_of_2", "linear"],
+                       default="powers_of_2",
+                       help="Thread sweep mode for scaling (default: powers_of_2)")
+        g.add_argument("--max-threads", type=int, metavar="N",
+                       help="Max threads for scaling sweep")
+        g.add_argument("--smt", action="store_true",
+                       help="Include SMT/HT siblings in scaling study")
+        g.add_argument("--arg", nargs="*", metavar="key=value",
+                       help="Workload-specific arguments (e.g. --arg time=30 prime=50000)")
+
+    # cloud-run
+    p_crun = subparsers.add_parser(
+        "cloud-run",
+        help="Provision a VM, run benchmarks, fetch results, then destroy the VM",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            Examples:
+              # GCP — single run
+              python main.py cloud-run --provider gcp --region us-central1 \\
+                --instance-type n2-standard-4 --workload python_bench --config full_socket
+
+              # AWS — scaling study, keep VM afterwards
+              python main.py cloud-run --provider aws --region us-east-1 \\
+                --instance-type m5.xlarge --aws-key-name my-keypair \\
+                --workload sysbench_cpu --scaling --max-threads 16 --no-teardown
+
+              # Azure — custom iterations
+              python main.py cloud-run --provider azure --region eastus \\
+                --instance-type Standard_D4s_v3 --workload stream --iterations 3
+        """),
+    )
+    _add_vm_args(p_crun)
+    _add_bench_args(p_crun)
+    p_crun.add_argument("--no-teardown", action="store_true",
+                        help="Keep VM running after benchmark (tracked by cloud-list)")
+    p_crun.add_argument("--verbose", action="store_true",
+                        help="Print detailed output from remote commands")
+
+    # cloud-provision
+    p_cprov = subparsers.add_parser(
+        "cloud-provision",
+        help="Provision a cloud VM and save it for later use with cloud-exec",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            Examples:
+              python main.py cloud-provision --provider gcp --region us-central1 \\
+                --instance-type n2-standard-4
+              python main.py cloud-provision --provider aws --region us-east-1 \\
+                --instance-type m5.xlarge --aws-key-name my-keypair
+        """),
+    )
+    _add_vm_args(p_cprov)
+    p_cprov.add_argument("--verbose", action="store_true")
+
+    # cloud-exec
+    p_cexec = subparsers.add_parser(
+        "cloud-exec",
+        help="Run benchmarks on a VM that was provisioned with cloud-provision",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            Examples:
+              python main.py cloud-exec --vm-name benchmark-abc12345 \\
+                --workload python_bench --config full_socket --iterations 3
+              python main.py cloud-exec --vm-name benchmark-abc12345 \\
+                --workload sysbench_cpu --scaling --skip-setup
+        """),
+    )
+    p_cexec.add_argument("--vm-name", required=True, metavar="NAME",
+                         help="Name of a VM from 'cloud-list'")
+    p_cexec.add_argument("--skip-setup", action="store_true",
+                         help="Skip toolkit sync and workload setup (VM already prepared)")
+    p_cexec.add_argument("--verbose", action="store_true")
+    _add_bench_args(p_cexec)
+
+    # cloud-destroy
+    p_cdest = subparsers.add_parser(
+        "cloud-destroy",
+        help="Destroy a tracked cloud VM",
+    )
+    p_cdest.add_argument("--vm-name", required=True, metavar="NAME",
+                         help="Name of the VM to destroy (from cloud-list)")
+
+    # cloud-list
+    subparsers.add_parser(
+        "cloud-list",
+        help="List cloud VMs tracked by this toolkit",
+    )
+
     return parser
 
 
@@ -669,6 +1002,11 @@ def main():
         "run": cmd_run,
         "scaling": cmd_scaling,
         "report": cmd_report,
+        "cloud-run": cmd_cloud_run,
+        "cloud-provision": cmd_cloud_provision,
+        "cloud-exec": cmd_cloud_exec,
+        "cloud-destroy": cmd_cloud_destroy,
+        "cloud-list": cmd_cloud_list,
     }
 
     handler = dispatch.get(args.command)
