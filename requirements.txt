@@ -1,0 +1,8 @@
+# Optional dependencies for the benchmark toolkit.
+# The toolkit is fully functional without these packages.
+
+# Richer table output (list-workloads, list-configs, run summary, scaling tables)
+tabulate>=0.9.0
+
+# YAML config file support (future use)
+pyyaml>=6.0
