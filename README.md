@@ -1,6 +1,8 @@
 # Garuda — Workload Automation Toolkit
 
-A Python toolkit for setting up, running, and collecting results from CPU, memory, and I/O benchmarks. Workloads are pinned to specific cores via `taskset` and `numactl`, and the built-in scaling study engine sweeps across configurations automatically.
+A Python toolkit for measuring Linux kernel and system performance across CPU, memory, networking, and I/O. Workloads are pinned to specific cores via `taskset` and `numactl`, and the built-in scaling study engine sweeps across configurations automatically.
+
+Includes dedicated benchmarks for every major Linux kernel subsystem: scheduler latency, memory allocation, memory hierarchy, address translation, TCP/IP stack, socket latency, and the virtual filesystem.
 
 A cloud orchestrator layer sits on top: it can provision a VM on **Google Cloud (GCP)**, **Microsoft Azure**, or **Amazon AWS**, deploy the toolkit over SSH, run the benchmarks remotely, stream results back, and optionally tear down the VM — all from a single command.
 
@@ -61,7 +63,19 @@ tools/
 │   ├── python_bench.py         # Pure Python (always works, no deps)
 │   ├── sysbench.py             # sysbench CPU
 │   ├── stream.py               # STREAM memory bandwidth
-│   └── fio_bench.py            # FIO I/O benchmark
+│   ├── multichase.py           # Memory latency (pointer chasing)
+│   ├── fio_bench.py            # FIO I/O benchmark
+│   ├── sysbench_mysql.py       # sysbench OLTP against MySQL in Docker
+│   │
+│   │   ── Linux kernel subsystem benchmarks ──
+│   ├── schbench.py             # Scheduler: wakeup-latency percentiles
+│   ├── hackbench.py            # Scheduler: task-communication throughput
+│   ├── cyclictest.py           # Scheduler: RT timer latency
+│   ├── mem_lat.py              # Memory: hierarchy latency (L1→DRAM) + TLB
+│   ├── mem_alloc.py            # Memory: allocation throughput (malloc/mmap/brk)
+│   ├── iperf3.py               # Networking: loopback TCP throughput
+│   ├── sockperf.py             # Networking: socket round-trip latency
+│   └── fs_mark.py              # VFS: file metadata throughput
 └── results/                    # Auto-created; one subdirectory per run
     └── cloud_vms.json          # Tracked cloud VMs (written by cloud-provision)
 ```
@@ -172,13 +186,22 @@ python3 main.py setup --workload stream --install-dir /opt/benchmarks/bin
 
 **What each workload does:**
 
-| Workload | Install method | Requirements |
+| Workload | Install method | Package / source |
 |---|---|---|
 | `python_bench` | No install needed | Python only |
-| `sysbench_cpu` | Package manager (`apt`/`yum`/`dnf`/`pacman`) | `sudo` |
-| `stream` | Download `stream.c` + compile with `gcc -fopenmp` | `gcc`, internet |
-| `fio` | Package manager (`apt`/`yum`/`dnf`/`pacman`) | `sudo` |
-| `multichase` | `git clone` + `make` | `git`, `make`, `gcc`, internet |
+| `sysbench_cpu` | Package manager | `sysbench` |
+| `stream` | Download + compile | `stream.c` + `gcc -fopenmp` |
+| `multichase` | `git clone` + `make` | github.com/google/multichase |
+| `fio` | Package manager | `fio` |
+| `sysbench_mysql` | Package manager + Docker | `sysbench`, `docker` |
+| `schbench` | Package manager | `schbench` |
+| `hackbench` | Package manager | `rt-tests` |
+| `cyclictest` | Package manager | `rt-tests` |
+| `mem_lat` | Package manager | `lmbench` |
+| `mem_alloc` | Package manager | `stress-ng` |
+| `iperf3` | Package manager | `iperf3` |
+| `sockperf` | Package manager | `sockperf` |
+| `fs_mark` | Package manager | `fs-mark` |
 
 The `STREAM_ARRAY_SIZE` is auto-detected from the system's L3 cache size (targeting 4× L3) so the arrays always fit in DRAM during the benchmark.
 
@@ -885,6 +908,280 @@ python3 main.py scaling --workload fio --configs 1c1t,2c2t,4c4t,8c8t \
 ```
 
 **Metrics:** `read_iops`, `read_bw_kb_s`, `write_iops`, `write_bw_kb_s`, `read_lat_us`, `write_lat_us`
+
+---
+
+## Linux Kernel Subsystem Benchmarks
+
+These workloads measure specific kernel subsystems directly. All follow the same `run` / `scaling` / `cloud-run` interface as other workloads.
+
+**Install all dependencies at once:**
+
+```bash
+sudo apt install rt-tests schbench lmbench stress-ng iperf3 sockperf fs-mark
+```
+
+---
+
+### `schbench` — Scheduler Wakeup Latency
+
+**Dependencies:** `apt install schbench`  
+**Subsystem:** CPU Scheduling
+
+Measures how quickly the scheduler wakes a sleeping thread after being signalled. Two layers of threads: message-passers wake workers and record the resulting latency percentiles. A direct measure of scheduler responsiveness under contention.
+
+```bash
+python3 main.py run --workload schbench --config 4c4t
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `message_threads` | `2` | Number of message-passer threads (`-m`) |
+| `worker_threads` | `16` | Worker threads per message-passer (`-t`) |
+| `runtime` | `30` | Duration in seconds (`-r`) |
+
+```bash
+# High-contention: many workers, longer run
+python3 main.py run --workload schbench --config full_socket \
+    --arg message_threads=4 worker_threads=32 runtime=60
+```
+
+**Metrics:** `wakeup_p50_us`, `wakeup_p75_us`, `wakeup_p90_us`, `wakeup_p95_us`, `wakeup_p99_us`, `wakeup_p99_5_us`, `wakeup_p99_9_us`, `wakeup_min_us`, `wakeup_max_us`
+
+---
+
+### `hackbench` — Scheduler Communication Throughput
+
+**Dependencies:** `apt install rt-tests`  
+**Subsystem:** CPU Scheduling
+
+Creates groups of tasks that pass messages to each other through sockets or pipes. Measures scheduling throughput: how fast the kernel can context-switch and deliver messages between many competing tasks. Lower `time_sec` = faster scheduler.
+
+```bash
+python3 main.py run --workload hackbench --config 4c4t
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `groups` | `10` | Number of task groups (`-g`) |
+| `loops` | `1000` | Messages per sender per run (`-l`) |
+| `data_size` | `100` | Message size in bytes (`-s`) |
+| `use_threads` | `false` | Use threads instead of processes (`-T`) |
+| `use_pipes` | `false` | Use pipes instead of sockets (`-p`) |
+
+```bash
+# Thread-based, with pipes
+python3 main.py run --workload hackbench --config 8c8t \
+    --arg groups=20 use_threads=true use_pipes=true
+
+# Scaling study: how scheduling throughput changes with core count
+python3 main.py scaling --workload hackbench --configs 1c1t,2c2t,4c4t,8c8t,16c16t
+```
+
+**Metrics:** `time_sec`
+
+---
+
+### `cyclictest` — Real-Time Timer Latency
+
+**Dependencies:** `apt install rt-tests`  
+**Subsystem:** CPU Scheduling / Real-Time
+
+Measures the latency from when a POSIX timer fires to when the sleeping thread is actually scheduled. Captures interrupt handling overhead, scheduler jitter, and real-time responsiveness. Run as root for accurate RT-priority results.
+
+```bash
+# Run as root for proper RT-FIFO priority
+sudo python3 main.py run --workload cyclictest --config 4c4t
+
+# Non-root run (reduced accuracy, still useful for relative comparisons)
+python3 main.py run --workload cyclictest --config 4c4t \
+    --arg priority=0 mlockall=false
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `loops` | `100000` | Measurement loops per thread (`-l`) |
+| `interval_us` | `1000` | Timer interval in microseconds (`-i`) |
+| `priority` | `99` | RT SCHED_FIFO priority; 0 = no RT (`-p`) |
+| `mlockall` | `true` | Lock all memory pages to prevent page-fault jitter (`-m`) |
+
+```bash
+# Short high-frequency run
+python3 main.py run --workload cyclictest --config 8c8t \
+    --arg loops=500000 interval_us=200
+```
+
+**Metrics:** `latency_min_us`, `latency_avg_us`, `latency_max_us` (worst-case across all threads)
+
+---
+
+### `mem_lat` — Memory Hierarchy Latency
+
+**Dependencies:** `apt install lmbench`  
+**Subsystem:** Memory Access, Address Translation
+
+Sweeps working-set size from L1 cache through main DRAM using pointer chasing (`lat_mem_rd`). The latency inflection points reveal L1/L2/L3 cache capacities. TLB pressure becomes visible at sizes beyond the L3 cache where page-table walks dominate.
+
+```bash
+python3 main.py run --workload mem_lat --config 1c1t
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `max_size_mb` | `512` | Sweep upper bound in MB |
+| `stride` | `128` | Stride between pointer loads in bytes (128 = 2 cache lines) |
+| `trials` | `3` | Timing trials per size point (`-t`) |
+
+```bash
+# Page-stride run (4096 bytes) — maximises TLB pressure
+python3 main.py run --workload mem_lat --config 1c1t --arg stride=4096
+
+# Scaling study: DRAM latency under increasing thread count (NUMA pressure)
+python3 main.py scaling --workload mem_lat --configs 1c1t,2c2t,4c4t,8c8t,16c16t
+```
+
+**Metrics:** `lat_l1_ns`, `lat_l2_ns`, `lat_l3_ns`, `lat_l3b_ns`, `lat_dram_ns`, `lat_min_ns`, `lat_max_ns`
+
+> **TLB tip:** Run twice — once with `stride=128` (cache-line) and once with `stride=4096` (page). The latency difference at large sizes (e.g. 64 MB+) is the TLB miss overhead.
+
+---
+
+### `mem_alloc` — Memory Allocation Throughput
+
+**Dependencies:** `apt install stress-ng`  
+**Subsystem:** Memory Allocation (buddy allocator, slab, brk, mmap, page faults)
+
+Measures allocation throughput in bogo-ops/sec using `stress-ng`. Three stressors exercise different kernel paths:
+
+| Stressor | Kernel path |
+|---|---|
+| `malloc` | glibc → `brk` / `mmap` → page-fault handler |
+| `mmap` | `mmap(2)` directly → anonymous mapping → page-fault handler |
+| `brk` | `brk(2)` → heap expansion |
+
+```bash
+python3 main.py run --workload mem_alloc --config 4c4t
+python3 main.py run --workload mem_alloc --config 4c4t --arg stressor=mmap
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `stressor` | `malloc` | `malloc`, `mmap`, or `brk` |
+| `duration` | `60` | Duration in seconds |
+
+```bash
+# Compare all three allocation paths
+for s in malloc mmap brk; do
+    python3 main.py run --workload mem_alloc --config 8c8t --arg stressor=$s duration=30
+done
+
+# Scaling study for malloc throughput
+python3 main.py scaling --workload mem_alloc --configs 1c1t,2c2t,4c4t,8c8t,16c16t
+```
+
+**Metrics:** `malloc_bogo_ops_per_sec` (or `mmap_` / `brk_` prefix depending on stressor)
+
+---
+
+### `iperf3` — Network Stack Throughput
+
+**Dependencies:** `apt install iperf3`  
+**Subsystem:** Networking (TCP/IP stack, socket layer, sk_buff, softirq)
+
+Runs an iperf3 server and client on the loopback interface. Loopback bypasses the NIC driver but exercises the full kernel TCP/IP stack: socket layer, TCP congestion control, `sk_buff` allocation, and softirq handling. A setup/teardown server process is managed automatically.
+
+```bash
+python3 main.py run --workload iperf3 --config 4c4t
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `port` | `5201` | iperf3 port |
+| `duration` | `30` | Test duration in seconds (`-t`) |
+| `streams` | `1` | Parallel TCP streams (`-P`) |
+| `udp` | `false` | Use UDP instead of TCP (`-u`) |
+| `reverse` | `false` | Reverse direction: server→client (`-R`) |
+
+```bash
+# Multi-stream for higher throughput
+python3 main.py run --workload iperf3 --config 4c4t --arg streams=4 duration=60
+
+# UDP test
+python3 main.py run --workload iperf3 --config 2c2t --arg udp=true
+
+# Scaling study: how TCP throughput scales with thread count
+python3 main.py scaling --workload iperf3 --configs 1c1t,2c2t,4c4t,8c8t \
+    --arg streams=4
+```
+
+**Metrics:** `throughput_gbps`, `retransmits`
+
+---
+
+### `sockperf` — Network Socket Latency
+
+**Dependencies:** `apt install sockperf`  
+**Subsystem:** Networking (socket layer, send/recv path, scheduling)
+
+Runs a sockperf ping-pong test over the loopback interface, measuring round-trip socket latency. Exercises the kernel socket layer, the TCP/UDP send and receive paths, and thread scheduling for network operations. A setup/teardown server process is managed automatically.
+
+```bash
+python3 main.py run --workload sockperf --config 1c1t
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `port` | `11111` | Server port |
+| `duration` | `30` | Test duration in seconds |
+| `msg_size` | `14` | Payload size in bytes (14 = minimum) |
+| `udp` | `false` | Use UDP instead of TCP |
+
+```bash
+# Larger message size
+python3 main.py run --workload sockperf --config 1c1t --arg msg_size=1024 duration=60
+
+# UDP latency
+python3 main.py run --workload sockperf --config 1c1t --arg udp=true
+```
+
+**Metrics:** `latency_avg_us`, `latency_p50_us`, `latency_p99_us`, `latency_p999_us`
+
+---
+
+### `fs_mark` — VFS Metadata Throughput
+
+**Dependencies:** `apt install fs-mark`  
+**Subsystem:** Virtual Filesystem (VFS, dentry cache, inode allocation)
+
+Creates, syncs, and deletes large numbers of small files in repeated cycles, measuring files-per-second throughput. Stresses the VFS layer: dentry and inode cache, dcache locking, directory entry management, and the underlying filesystem's metadata path.
+
+```bash
+python3 main.py run --workload fs_mark --config 4c4t
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `num_files` | `4096` | Files created per iteration (`-n`) |
+| `file_size` | `4096` | File size in bytes; `0` = metadata-only (`-s`) |
+| `iterations` | `5` | Create/sync/delete cycles (`-L`) |
+| `dir` | _(work_dir)_ | Working directory; defaults to a temp subdir |
+| `subdirs` | `0` | Number of subdirectories; `0` = flat layout (`-D`) |
+| `sync_writes` | `true` | `fsync` each file after write (`-S`) |
+
+```bash
+# Metadata-only (no file content written)
+python3 main.py run --workload fs_mark --config 4c4t --arg file_size=0
+
+# Large-file variant on a fast NVMe
+python3 main.py run --workload fs_mark --config 8c8t \
+    --arg num_files=1000 file_size=65536 dir=/mnt/nvme/fsmark
+
+# Scaling study: VFS throughput vs thread count
+python3 main.py scaling --workload fs_mark --configs 1c1t,2c2t,4c4t,8c8t,16c16t \
+    --arg num_files=2048 file_size=0 iterations=10
+```
+
+**Metrics:** `files_per_sec`
 
 ---
 
