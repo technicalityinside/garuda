@@ -94,7 +94,6 @@ class GCPProvider(CloudProvider):
             )
         print(f"[gcp] Confidential Computing enabled: type={ctype}")
         return [
-            '--confidential-compute',
             f'--confidential-compute-type={ctype}',
             '--maintenance-policy=TERMINATE',  # live migration not supported for CVM
         ]
