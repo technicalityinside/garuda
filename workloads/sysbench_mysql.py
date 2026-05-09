@@ -7,6 +7,22 @@ setup()    — pull MySQL image, start container, wait for ready, run sysbench p
 run        — sysbench <test> run  (CPU-pinned by the benchmark runner via taskset)
 teardown() — sysbench cleanup, docker stop + rm
 
+CPU pinning
+-----------
+Two independent layers of pinning are available:
+
+  mysql_cpus / mysql_mems  (--arg mysql_cpus=0-3 mysql_mems=0)
+      Pin the MySQL Docker container to specific CPU cores and/or NUMA memory
+      nodes via Docker's --cpuset-cpus / --cpuset-mems flags.  Accepts any
+      value that Docker accepts: "0", "0,1,2,3", "0-3", "0-3,8-11", etc.
+
+  BenchmarkConfig.cpu_list  (--config / --threads)
+      Pin the sysbench client process to cores via taskset, as with every
+      other workload in the toolkit.
+
+Combining both lets you isolate server and client onto disjoint core sets,
+which produces cleaner per-core measurements.
+
 Requirements
 ------------
   - sysbench  (apt install sysbench)
@@ -72,6 +88,9 @@ class SysbenchMySQL(BaseWorkload):
             "report_interval": 10,                 # per-interval stdout report (seconds)
             "mysql_port":      13306,              # host port mapped to container 3306
             "mysql_image":     "mysql:8.0",        # Docker image to pull
+            # CPU/NUMA pinning for the MySQL container (passed to docker --cpuset-*)
+            "mysql_cpus":      "",                 # e.g. "0-3" or "0,1,2,3"; "" = no pin
+            "mysql_mems":      "",                 # e.g. "0" or "0,1";        "" = no pin
         }
 
     @property
@@ -198,6 +217,25 @@ class SysbenchMySQL(BaseWorkload):
         subprocess.run(["docker", "stop", container], capture_output=True)
         subprocess.run(["docker", "rm",   container], capture_output=True)
 
+    def _docker_cpuset_args(self, cfg: Dict) -> List[str]:
+        """Validate and return --cpuset-cpus / --cpuset-mems flags for docker run."""
+        args = []
+        for flag, key, label in (
+            ("--cpuset-cpus", "mysql_cpus", "mysql_cpus"),
+            ("--cpuset-mems", "mysql_mems", "mysql_mems"),
+        ):
+            value = str(cfg.get(key, "")).strip()
+            if not value:
+                continue
+            # Accept: single int, range (N-M), or comma-separated mix thereof
+            if not re.fullmatch(r"\d+(-\d+)?(,\d+(-\d+)?)*", value):
+                raise ValueError(
+                    f"Invalid {label}={value!r}. "
+                    "Use comma-separated integers or ranges: '0', '0,1,2,3', '0-3', '0-3,8-11'."
+                )
+            args += [flag, value]
+        return args
+
     # ── BaseWorkload interface ─────────────────────────────────────────────────
 
     def setup(self, config: BenchmarkConfig, work_dir: str) -> None:
@@ -220,9 +258,18 @@ class SysbenchMySQL(BaseWorkload):
 
         # Start container
         container = f"sysbench-mysql-{os.getpid()}"
+        cpuset_args = self._docker_cpuset_args(cfg)
+
+        pin_parts = []
+        if cfg.get("mysql_cpus"):
+            pin_parts.append(f"cpuset-cpus={cfg['mysql_cpus']}")
+        if cfg.get("mysql_mems"):
+            pin_parts.append(f"cpuset-mems={cfg['mysql_mems']}")
+        pin_info = f"  [{', '.join(pin_parts)}]" if pin_parts else ""
+
         print(
             f"[sysbench_mysql] Starting MySQL container '{container}' "
-            f"(host port {port} → container 3306)...",
+            f"(port {port}){pin_info}...",
             flush=True,
         )
         subprocess.run(
@@ -233,8 +280,7 @@ class SysbenchMySQL(BaseWorkload):
                 "-e", f"MYSQL_ROOT_PASSWORD={_MYSQL_PASSWORD}",
                 "-e", f"MYSQL_DATABASE={_MYSQL_DB}",
                 "-p", f"{port}:3306",
-                image,
-            ],
+            ] + cpuset_args + [image],
             check=True,
         )
         self._write_container(work_dir, container)
