@@ -911,6 +911,48 @@ python3 main.py scaling --workload fio --configs 1c1t,2c2t,4c4t,8c8t \
 
 ---
 
+### `sysbench_mysql` — OLTP Benchmark against MySQL
+
+**Dependencies:** `apt install sysbench` + Docker Engine running
+
+Spawns a MySQL 8 Docker container, prepares sysbench OLTP tables inside it, runs the benchmark, then tears down the container. The MySQL server and the sysbench client can be pinned to disjoint CPU sets for clean per-core measurements.
+
+```bash
+python3 main.py run --workload sysbench_mysql --config 4c4t
+```
+
+| Argument | Default | Description |
+|---|---|---|
+| `test` | `oltp_read_write` | sysbench OLTP test: `oltp_read_write`, `oltp_read_only`, `oltp_write_only`, `oltp_point_select`, `oltp_insert`, `oltp_delete`, etc. |
+| `tables` | `10` | Number of test tables |
+| `table_size` | `100000` | Rows per table |
+| `time` | `60` | Benchmark duration in seconds |
+| `report_interval` | `10` | Per-interval progress report (seconds) |
+| `mysql_port` | `13306` | Host port mapped to the container's 3306 |
+| `mysql_image` | `mysql:8.0` | Docker image to pull |
+| `mysql_cpus` | _(none)_ | Pin MySQL container to these cores: `"0-3"`, `"0,1,2,3"` |
+| `mysql_mems` | _(none)_ | Pin MySQL container to these NUMA nodes: `"0"`, `"0,1"` |
+
+```bash
+# Read-only workload, larger dataset
+python3 main.py run --workload sysbench_mysql --config 8c8t \
+    --arg test=oltp_read_only tables=20 table_size=500000 time=120
+
+# Pin MySQL server to cores 0-3, sysbench client to cores 4-7
+python3 main.py run --workload sysbench_mysql --config 4c4t \
+    --arg mysql_cpus=0-3 mysql_mems=0
+
+# Write-heavy, short run
+python3 main.py run --workload sysbench_mysql --config 4c4t \
+    --arg test=oltp_write_only time=30
+```
+
+**Metrics:** `transactions_per_sec`, `queries_per_sec`, `errors_per_sec`, `total_time_sec`, `total_events`, `latency_min_ms`, `latency_avg_ms`, `latency_max_ms`, `latency_p95_ms`
+
+> **CPU pinning:** `mysql_cpus` / `mysql_mems` pin the Docker container via `--cpuset-cpus` / `--cpuset-mems`. The sysbench client is separately pinned by the runner via `taskset`. Using disjoint sets (e.g. server on `0-3`, client on `4-7`) isolates server and client noise for cleaner results.
+
+---
+
 ## Linux Kernel Subsystem Benchmarks
 
 These workloads measure specific kernel subsystems directly. All follow the same `run` / `scaling` / `cloud-run` interface as other workloads.
