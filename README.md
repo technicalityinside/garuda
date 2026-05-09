@@ -1,4 +1,4 @@
-# Workload Automation Toolkit
+# Garuda — Workload Automation Toolkit
 
 A Python toolkit for setting up, running, and collecting results from CPU, memory, and I/O benchmarks. Workloads are pinned to specific cores via `taskset` and `numactl`, and the built-in scaling study engine sweeps across configurations automatically.
 

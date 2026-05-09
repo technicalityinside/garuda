@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-main.py - CLI entry point for the benchmark toolkit.
+main.py - CLI entry point for the Garuda benchmark toolkit.
 
 Subcommands:
   list-workloads          List all discovered workloads
@@ -695,8 +695,8 @@ def _print_run_summary_table(workload: str, config: str, iterations: int, summar
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="benchmark_toolkit",
-        description="Python workload automation toolkit",
+        prog="garuda",
+        description="Garuda — Python workload automation toolkit",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
             Examples:
