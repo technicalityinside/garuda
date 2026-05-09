@@ -2,19 +2,34 @@
 
 A Python toolkit for setting up, running, and collecting results from CPU, memory, and I/O benchmarks. Workloads are pinned to specific cores via `taskset` and `numactl`, and the built-in scaling study engine sweeps across configurations automatically.
 
+A cloud orchestrator layer sits on top: it can provision a VM on **Google Cloud (GCP)**, **Microsoft Azure**, or **Amazon AWS**, deploy the toolkit over SSH, run the benchmarks remotely, stream results back, and optionally tear down the VM — all from a single command.
+
 ---
 
 ## Requirements
 
+### Local machine
+
 - Python 3.9+
 - Linux (reads CPU topology from `/sys/devices/system/cpu/`)
 - `taskset` (util-linux) and `numactl` — present on most distros
+- `rsync` — for syncing the toolkit to cloud VMs
 
 Optional Python packages (richer table output, no functional impact if missing):
 
 ```
 pip install tabulate
 ```
+
+### Cloud orchestration (only needed for `cloud-*` commands)
+
+| Provider | CLI tool | Auth |
+|---|---|---|
+| GCP | `gcloud` (Google Cloud SDK) | `gcloud auth login` |
+| Azure | `az` (Azure CLI) | `az login` |
+| AWS | `aws` (AWS CLI v2) | `aws configure` |
+
+An SSH key pair is required (`~/.ssh/id_rsa` + `~/.ssh/id_rsa.pub` by default). For AWS, you also need an existing EC2 key pair name in your account.
 
 No other Python dependencies are required. The `python_bench` workload works out of the box. All other workloads require their respective system binaries (see [Workloads](#workloads)).
 
@@ -24,7 +39,7 @@ No other Python dependencies are required. The `python_bench` workload works out
 
 ```
 tools/
-├── main.py                     # CLI entry point
+├── main.py                     # CLI entry point (local + cloud commands)
 ├── requirements.txt
 ├── benchmark_toolkit/          # Core library
 │   ├── system.py               # CPU/NUMA topology detection
@@ -34,17 +49,28 @@ tools/
 │   ├── runner.py               # Execution engine (taskset, numactl, timing)
 │   ├── collector.py            # Results → JSON + CSV + summary stats
 │   └── scaling.py              # Scaling study orchestrator
+├── orchestrator/               # Cloud orchestration layer
+│   ├── base.py                 # VMConfig, VMInstance dataclasses + CloudProvider ABC
+│   ├── gcp.py                  # GCPProvider  (gcloud CLI)
+│   ├── azure.py                # AzureProvider (az CLI)
+│   ├── aws.py                  # AWSProvider  (aws CLI)
+│   ├── remote.py               # RemoteExecutor — SSH + rsync
+│   ├── runner.py               # CloudBenchmarkRunner — end-to-end lifecycle
+│   └── state.py                # VMStateStore — persists VM info locally
 ├── workloads/                  # Drop new .py files here to add workloads
 │   ├── python_bench.py         # Pure Python (always works, no deps)
 │   ├── sysbench.py             # sysbench CPU
 │   ├── stream.py               # STREAM memory bandwidth
 │   └── fio_bench.py            # FIO I/O benchmark
 └── results/                    # Auto-created; one subdirectory per run
+    └── cloud_vms.json          # Tracked cloud VMs (written by cloud-provision)
 ```
 
 ---
 
 ## Quick Start
+
+### Local benchmarks
 
 ```bash
 # 1. Check what's installed and what needs setup
@@ -69,6 +95,31 @@ python3 main.py scaling --workload python_bench --configs 1c1t,1c2t,2c2t,2c4t
 # 7. List and inspect saved results
 python3 main.py report --list
 python3 main.py report --run-id <run_id>
+```
+
+### Cloud benchmarks
+
+```bash
+# GCP — spin up a VM, run a benchmark, fetch results, destroy the VM
+python3 main.py cloud-run \
+  --provider gcp --region us-central1 --instance-type n2-standard-4 \
+  --workload python_bench --config full_socket --iterations 3
+
+# AWS — scaling study on a persistent VM (kept running for further use)
+python3 main.py cloud-run \
+  --provider aws --region us-east-1 \
+  --instance-type m5.xlarge --aws-key-name my-keypair \
+  --workload sysbench_cpu --scaling --max-threads 16 --no-teardown
+
+# List VMs you've provisioned
+python3 main.py cloud-list
+
+# Run another benchmark on that same VM (toolkit already deployed)
+python3 main.py cloud-exec --vm-name benchmark-abc12345 \
+  --workload stream --config full_socket --skip-setup
+
+# Destroy when done
+python3 main.py cloud-destroy --vm-name benchmark-abc12345
 ```
 
 ---
@@ -301,6 +352,267 @@ CSV columns: `run_id`, `workload`, `config_name`, `num_threads`, `metric_name`, 
 
 ---
 
+## Cloud Orchestration
+
+The `orchestrator/` package adds a provider-agnostic layer that:
+
+1. **Provisions** a VM on GCP, Azure, or AWS using the respective CLI tool
+2. **Waits** for the VM to reach running state and for SSH to become available
+3. **Deploys** the benchmark toolkit via `rsync`
+4. **Installs** workload dependencies on the remote VM (`python3 main.py setup`)
+5. **Runs** any `run` or `scaling` command remotely and streams output
+6. **Fetches** the `results/` directory back to the local machine
+7. **Destroys** the VM (or keeps it with `--no-teardown`)
+
+VM state is persisted to `results/cloud_vms.json` so provisioned VMs can be referenced by name in subsequent commands.
+
+### Prerequisites
+
+| Provider | CLI | Auth command |
+|---|---|---|
+| GCP | `gcloud` | `gcloud auth login && gcloud config set project PROJECT_ID` |
+| Azure | `az` | `az login` |
+| AWS | `aws` | `aws configure` |
+
+SSH key:
+- Default: `~/.ssh/id_rsa` (private) + `~/.ssh/id_rsa.pub` (public)
+- Override with `--ssh-key-path /path/to/key`
+- AWS additionally requires `--aws-key-name` — the name of an EC2 key pair already registered in your account
+
+### Common VM arguments
+
+These flags are shared by `cloud-run` and `cloud-provision`:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--provider` | _(required)_ | `gcp`, `azure`, or `aws` |
+| `--region` | _(required)_ | Provider region (e.g. `us-central1`, `eastus`, `us-east-1`) |
+| `--instance-type` | _(required)_ | Machine type (e.g. `n2-standard-4`, `Standard_D4s_v3`, `m5.xlarge`) |
+| `--ssh-key-path PATH` | `~/.ssh/id_rsa` | Local private key for SSH |
+| `--ssh-user USER` | `ubuntu` | SSH username on the VM |
+| `--vm-name NAME` | auto-generated | Custom name (e.g. `benchmark-perftest`) |
+| `--disk-size GB` | `50` | Boot disk size in GB |
+| `--image IMAGE` | Ubuntu 22.04 LTS | OS image override |
+| `--gcp-zone ZONE` | `{region}-a` | GCP zone (e.g. `us-central1-b`) |
+| `--gcp-project ID` | gcloud default | GCP project ID |
+| `--aws-key-name NAME` | _(required for AWS)_ | EC2 key pair name |
+| `--aws-profile NAME` | AWS CLI default | Named AWS CLI profile |
+| `--azure-resource-group RG` | `benchmark-rg-{region}` | Azure resource group (created if missing) |
+| `--azure-subscription ID` | az default | Azure subscription ID |
+
+### Common benchmark arguments
+
+These flags are shared by `cloud-run` and `cloud-exec`:
+
+| Flag | Default | Description |
+|---|---|---|
+| `--workload NAME` | _(required)_ | Workload to run |
+| `--scaling` | off | Run a scaling study instead of a single benchmark run |
+| `--config PRESET` | `single_core` | Config preset for single run |
+| `--threads N` | — | Thread count for single run |
+| `--iterations N` | `1` | Iterations per config |
+| `--scaling-configs 1c1t,...` | — | Named presets for scaling study |
+| `--scaling-mode` | `powers_of_2` | Thread sweep mode (`powers_of_2` or `linear`) |
+| `--max-threads N` | all cores | Max threads for scaling sweep |
+| `--smt` | off | Include SMT siblings in scaling |
+| `--arg key=value` | — | Workload-specific arguments |
+
+---
+
+### `cloud-run`
+
+Provision a VM, run benchmarks, fetch results, and destroy the VM — all in one shot.
+
+```bash
+python3 main.py cloud-run \
+  --provider PROVIDER --region REGION --instance-type TYPE \
+  --workload NAME [benchmark options] \
+  [--no-teardown] [--verbose]
+```
+
+`--no-teardown` keeps the VM running and saves it to `results/cloud_vms.json` so you can reference it with `cloud-exec` and `cloud-destroy` later.
+
+**Examples:**
+
+```bash
+# GCP — single run, full socket, 3 iterations
+python3 main.py cloud-run \
+  --provider gcp --region us-central1 --instance-type n2-standard-4 \
+  --workload python_bench --config full_socket --iterations 3
+
+# GCP — scaling study with custom workload args
+python3 main.py cloud-run \
+  --provider gcp --region us-central1 --instance-type n2-standard-8 \
+  --workload sysbench_cpu --scaling --mode powers_of_2 --iterations 3 \
+  --arg prime=50000 time=30
+
+# Azure — memory bandwidth benchmark
+python3 main.py cloud-run \
+  --provider azure --region eastus --instance-type Standard_D8s_v3 \
+  --workload stream --config full_socket --iterations 5
+
+# AWS — scaling study, keep VM for further use
+python3 main.py cloud-run \
+  --provider aws --region us-east-1 \
+  --instance-type m5.2xlarge --aws-key-name my-keypair \
+  --workload sysbench_cpu --scaling --max-threads 8 \
+  --no-teardown
+
+# AWS — specific SSH key and custom VM name
+python3 main.py cloud-run \
+  --provider aws --region us-west-2 \
+  --instance-type c5.4xlarge --aws-key-name perf-key \
+  --ssh-key-path ~/.ssh/perf_key \
+  --vm-name my-perf-vm \
+  --workload python_bench --config full_socket
+```
+
+**End-to-end flow:**
+```
+[cloud] Creating n2-standard-4 on gcp (us-central1)...
+[cloud] VM 'benchmark-a3f2c1b0' created, waiting for running state...
+[cloud] VM running at 34.56.78.90. Waiting for SSH...
+[cloud] SSH ready.
+[cloud] Installing system dependencies (python3, pip3, rsync)...
+[cloud] Syncing toolkit to remote:~/benchmark_toolkit ...
+[cloud] Toolkit deployed.
+[cloud] Setting up workload 'python_bench' on remote VM...
+[cloud] Workload 'python_bench' ready.
+[cloud] Running: python3 main.py run --workload python_bench --config full_socket --iterations 3
+  ... benchmark output ...
+[cloud] Fetching results → ./results ...
+[cloud] Results downloaded.
+[cloud] VM 'benchmark-a3f2c1b0' destroyed.
+```
+
+---
+
+### `cloud-provision`
+
+Provision a VM and save it to the state store without running any benchmarks. Useful when you want to run multiple benchmark rounds against the same VM.
+
+```bash
+python3 main.py cloud-provision \
+  --provider PROVIDER --region REGION --instance-type TYPE \
+  [VM options]
+```
+
+**Examples:**
+
+```bash
+# GCP
+python3 main.py cloud-provision \
+  --provider gcp --region us-central1 --instance-type n2-standard-4
+
+# Azure with explicit resource group
+python3 main.py cloud-provision \
+  --provider azure --region westeurope --instance-type Standard_D4s_v3 \
+  --azure-resource-group my-benchmarks-rg
+
+# AWS
+python3 main.py cloud-provision \
+  --provider aws --region ap-southeast-1 \
+  --instance-type m5.xlarge --aws-key-name singapore-key
+```
+
+**Output:**
+```
+VM 'benchmark-a3f2c1b0' is ready.
+  Provider:  gcp
+  Type:      n2-standard-4
+  IP:        34.56.78.90
+  SSH:       ssh -i ~/.ssh/id_rsa ubuntu@34.56.78.90
+
+  Run bench: python3 main.py cloud-exec --vm-name benchmark-a3f2c1b0 --workload <name>
+  Destroy:   python3 main.py cloud-destroy --vm-name benchmark-a3f2c1b0
+```
+
+---
+
+### `cloud-exec`
+
+Run benchmarks on a VM that was previously provisioned with `cloud-provision` or kept with `cloud-run --no-teardown`.
+
+```bash
+python3 main.py cloud-exec \
+  --vm-name NAME --workload NAME [benchmark options] \
+  [--skip-setup] [--verbose]
+```
+
+`--skip-setup` skips toolkit sync and workload binary installation — use this when the VM is already set up and you just want to run another benchmark.
+
+**Examples:**
+
+```bash
+# Full setup + benchmark (first time running on this VM)
+python3 main.py cloud-exec \
+  --vm-name benchmark-a3f2c1b0 \
+  --workload python_bench --config full_socket --iterations 3
+
+# Second run — skip setup since the toolkit is already deployed
+python3 main.py cloud-exec \
+  --vm-name benchmark-a3f2c1b0 \
+  --workload sysbench_cpu --scaling --mode powers_of_2 \
+  --skip-setup
+
+# FIO benchmark on the same VM
+python3 main.py cloud-exec \
+  --vm-name benchmark-a3f2c1b0 \
+  --workload fio --config 4c4t --arg rw=randread bs=4k size=2G \
+  --skip-setup
+```
+
+---
+
+### `cloud-destroy`
+
+Terminate and delete a tracked cloud VM, and remove it from `results/cloud_vms.json`.
+
+```bash
+python3 main.py cloud-destroy --vm-name NAME
+```
+
+**Example:**
+
+```bash
+python3 main.py cloud-destroy --vm-name benchmark-a3f2c1b0
+```
+
+For GCP this deletes the instance. For Azure this deletes the entire resource group (VM + disk + NIC + public IP). For AWS this terminates the instance.
+
+---
+
+### `cloud-list`
+
+List all VMs currently tracked in `results/cloud_vms.json`. State shown is from provisioning time; use `cloud-exec` or SSH directly to verify current state.
+
+```bash
+python3 main.py cloud-list
+```
+
+**Example output:**
+```
+Name                  Provider  Type             Region       IP            State
+benchmark-a3f2c1b0    gcp       n2-standard-4    us-central1  34.56.78.90   RUNNING
+benchmark-b7d9e2f1    aws       m5.xlarge         us-east-1    54.23.11.88   running
+
+2 tracked VM(s).  State shown is from provisioning time.
+```
+
+---
+
+### Instance type recommendations
+
+| Use case | GCP | Azure | AWS |
+|---|---|---|---|
+| CPU benchmark (4 cores) | `n2-standard-4` | `Standard_D4s_v3` | `m5.xlarge` |
+| CPU benchmark (8 cores) | `n2-standard-8` | `Standard_D8s_v3` | `m5.2xlarge` |
+| Memory bandwidth | `n2-standard-8` | `Standard_E8s_v3` | `r5.2xlarge` |
+| High core count | `n2-standard-32` | `Standard_D32s_v3` | `m5.8xlarge` |
+| Storage / FIO | `n2-standard-4` + persistent SSD | `Standard_D4s_v3` + Premium SSD | `i3.xlarge` (NVMe) |
+
+---
+
 ## Configurations
 
 ### NcMT Naming Convention
@@ -523,6 +835,7 @@ results/
   scaling_20260508_182437_python_bench_t1/
     results.json
   ...
+  cloud_vms.json              ← tracked cloud VMs
 ```
 
 A scaling study creates one top-level directory for the combined results plus one sub-directory per thread count or config. The top-level file stores all iterations across all configs and is what `report` and `print_scaling_table` operate on.
@@ -610,13 +923,18 @@ class MyBench(BaseWorkload):
         return {"duration": 10}
 ```
 
-After saving the file, it appears immediately in `list-workloads`:
+After saving the file, it appears immediately in `list-workloads` and works with cloud commands:
 
 ```bash
 python3 main.py list-workloads
 python3 main.py validate --workload my_bench
 python3 main.py run --workload my_bench --config full_socket --iterations 3
 python3 main.py scaling --workload my_bench --configs 1c1t,2c2t,4c4t,8c8t
+
+# Run on a cloud VM
+python3 main.py cloud-run \
+  --provider gcp --region us-central1 --instance-type n2-standard-4 \
+  --workload my_bench --config full_socket
 ```
 
 ### BaseWorkload interface
@@ -637,7 +955,7 @@ All methods in `BaseWorkload` (`benchmark_toolkit/base.py`):
 
 ### Passing workload arguments
 
-The `--arg` flag on `run` and `scaling` populates `config.workload_args`. Inside `build_command`, merge defaults first so CLI args always win:
+The `--arg` flag on `run`, `scaling`, and all `cloud-*` commands populates `config.workload_args`. Inside `build_command`, merge defaults first so CLI args always win:
 
 ```python
 def build_command(self, config):
