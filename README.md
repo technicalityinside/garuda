@@ -601,6 +601,72 @@ benchmark-b7d9e2f1    aws       m5.xlarge         us-east-1    54.23.11.88   run
 
 ---
 
+### Confidential Computing
+
+Pass `--confidential` to any `cloud-run` or `cloud-provision` command to launch a **Confidential VM** backed by hardware-level memory encryption. The benchmarks then run inside a hardware-attested, isolated environment.
+
+```bash
+# GCP — AMD SEV-SNP on an N2D instance
+python3 main.py cloud-run \
+  --provider gcp --region us-central1 --instance-type n2d-standard-4 \
+  --confidential --confidential-type SEV_SNP \
+  --workload python_bench --config full_socket
+
+# Azure — Confidential VM with full disk encryption
+python3 main.py cloud-run \
+  --provider azure --region eastus --instance-type Standard_DC4as_v5 \
+  --confidential --confidential-type DiskWithVMGuestState \
+  --workload sysbench_cpu --config full_socket --iterations 3
+
+# AWS — AMD SEV-SNP on an M6a instance
+python3 main.py cloud-run \
+  --provider aws --region us-east-1 \
+  --instance-type m6a.xlarge --aws-key-name my-keypair \
+  --confidential --confidential-type SevSnp \
+  --workload python_bench --config full_socket
+```
+
+#### `--confidential-type` values per provider
+
+| Provider | Value | Technology | Notes |
+|---|---|---|---|
+| GCP | `SEV` _(default)_ | AMD SEV | N2D or C2D machine types |
+| GCP | `SEV_SNP` | AMD SEV-SNP | N2D machine types |
+| GCP | `TDX` | Intel TDX | C3 machine types |
+| Azure | `VMGuestStateOnly` _(default)_ | AMD SEV-SNP | Encrypts VM guest state |
+| Azure | `DiskWithVMGuestState` | AMD SEV-SNP | Encrypts disk + VM guest state |
+| AWS | `SevSnp` _(default)_ | AMD SEV-SNP | `--cpu-options AmdSevSnp=enabled` |
+| AWS | `NitroEnclave` | AWS Nitro | Isolated enclave within the instance |
+
+#### Required instance types
+
+| Provider | Type | Required machine family |
+|---|---|---|
+| GCP SEV / SEV_SNP | `n2d-standard-*`, `c2d-standard-*` | `n2d-` or `c2d-` prefix |
+| GCP TDX | `c3-standard-*` | `c3-` prefix |
+| Azure CVM | `Standard_DC*as_v5`, `Standard_EC*as_v5` | DCasv5 / ECasv5 family |
+| AWS SEV-SNP | `m6a.*`, `c6a.*`, `r6a.*`, `m7a.*`, `c7a.*`, `r7a.*` | AMD EPYC families |
+| AWS Nitro Enclave | Any Nitro-based instance | Most modern instance types |
+
+#### Provider-specific notes
+
+**GCP**
+- Live migration is automatically disabled (`--maintenance-policy=TERMINATE`) — instances will stop on host maintenance events. Set appropriate restart policies if needed.
+- The default Ubuntu 22.04 LTS image works for SEV and SEV_SNP. TDX also uses the same image on GCP.
+- Validate launch with: `gcloud compute instances get-shielded-instance-identity INSTANCE_NAME --zone ZONE`
+
+**Azure**
+- A CVM-compatible image (`Canonical:ubuntu-24_04-lts:cvm:latest`) is selected automatically when `--confidential` is used and no `--image` override is given.
+- `VMGuestStateOnly` encrypts only the VM state; `DiskWithVMGuestState` also encrypts the OS disk — use the latter for stronger isolation at a small performance cost.
+- Verify attestation with: `az vm show --name NAME --resource-group RG --query securityProfile`
+
+**AWS**
+- AMD SEV-SNP requires an instance from the m6a, c6a, r6a, m7a, c7a, or r7a families. The flag `AmdSevSnp=enabled` is passed via `--cpu-options`.
+- Nitro Enclaves are an isolated compute partition *within* the instance (not full-instance memory encryption). They require a Nitro-based instance and the enclave application to run inside the enclave process separately.
+- Verify SNP attestation: use the AWS `GetAttestationDocument` API from inside the instance.
+
+---
+
 ### Instance type recommendations
 
 | Use case | GCP | Azure | AWS |

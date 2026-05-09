@@ -10,6 +10,22 @@ _TAG_KEY = 'created-by'
 _TAG_VALUE = 'benchmark-toolkit'
 _SG_NAME = 'benchmark-toolkit-sg'
 
+# Confidential Computing support on AWS.
+# Reference: https://docs.aws.amazon.com/AWSEC2/latest/UserGuide/amd-sev-snp.html
+#            https://docs.aws.amazon.com/enclaves/latest/user/nitro-enclave.html
+_CC_TYPES = {
+    'sevsnp':        'sev_snp',     # AMD SEV-SNP via --cpu-options AmdSevSnp=enabled
+    'sev_snp':       'sev_snp',
+    'amdsevsnp':     'sev_snp',
+    'amd_sev_snp':   'sev_snp',
+    'nitroenclave':  'nitro',       # AWS Nitro Enclaves
+    'nitro_enclave': 'nitro',
+    'nitro':         'nitro',
+}
+_CC_DEFAULT = 'sev_snp'
+# Instance families that support AMD SEV-SNP on AWS.
+_CC_SEV_SNP_FAMILIES = ('m6a', 'c6a', 'r6a', 'm7a', 'c7a', 'r7a', 'hpc7a')
+
 
 class AWSProvider(CloudProvider):
     """Cloud provider backed by the aws CLI."""
@@ -110,6 +126,31 @@ class AWSProvider(CloudProvider):
             extra={'region': inst_region},
         )
 
+    def _confidential_args(self, config: VMConfig) -> List[str]:
+        """Return ec2 run-instances flags required for Confidential Computing."""
+        if not config.confidential_compute:
+            return []
+        key = (config.confidential_type or _CC_DEFAULT).lower().replace('-', '').replace(' ', '')
+        cc_kind = _CC_TYPES.get(key)
+        if cc_kind is None:
+            raise ValueError(
+                f"Unknown AWS confidential type: {config.confidential_type!r}. "
+                f"Choose from: SevSnp (AMD SEV-SNP) or NitroEnclave."
+            )
+        if cc_kind == 'sev_snp':
+            family = config.instance_type.split('.')[0].lower()
+            if family not in _CC_SEV_SNP_FAMILIES:
+                print(
+                    f"[aws] WARNING: AMD SEV-SNP is supported on "
+                    f"{_CC_SEV_SNP_FAMILIES} instance families. "
+                    f"Got '{config.instance_type}'. The API will reject this if incompatible."
+                )
+            print("[aws] Confidential Computing enabled: AMD SEV-SNP")
+            return ['--cpu-options', 'AmdSevSnp=enabled']
+        # Nitro Enclave
+        print("[aws] Confidential Computing enabled: Nitro Enclave")
+        return ['--enclave-options', json.dumps({'Enabled': True})]
+
     # ── CloudProvider interface ────────────────────────────────────────────────
 
     def create_vm(self, config: VMConfig) -> VMInstance:
@@ -124,6 +165,7 @@ class AWSProvider(CloudProvider):
         key_path = os.path.expanduser(config.ssh_key_path or '~/.ssh/id_rsa')
         image_id = config.image or self._get_ubuntu_ami(config.region)
         sg_id = self._ensure_security_group(config.region)
+        cc_args = self._confidential_args(config)
 
         print(f"[aws] Launching '{name}' ({config.instance_type}) in {config.region}...")
         data = self._run(
@@ -146,7 +188,7 @@ class AWSProvider(CloudProvider):
                      {'Key': 'Name', 'Value': name},
                      {'Key': _TAG_KEY, 'Value': _TAG_VALUE},
                  ],
-             }])],
+             }])] + cc_args,
             region=config.region,
         )
 

@@ -20,6 +20,9 @@ class VMConfig:
     zone: Optional[str] = None           # GCP only; defaults to {region}-a
     resource_group: Optional[str] = None # Azure only
     tags: Dict[str, str] = field(default_factory=dict)
+    # Confidential Computing
+    confidential_compute: bool = False
+    confidential_type: Optional[str] = None  # provider-specific type string (see each provider)
 
 
 @dataclass

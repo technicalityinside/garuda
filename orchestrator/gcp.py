@@ -10,6 +10,15 @@ _LABEL = 'created-by=benchmark-toolkit'
 _DEFAULT_IMAGE_FAMILY = 'ubuntu-2204-lts'
 _DEFAULT_IMAGE_PROJECT = 'ubuntu-os-cloud'
 
+# Confidential VM: valid technology choices and their required machine-type prefixes.
+# Reference: https://cloud.google.com/confidential-computing/confidential-vm/docs/supported-configurations
+_CC_TYPES = {
+    'SEV':     ('n2d-', 'c2d-'),
+    'SEV_SNP': ('n2d-',),
+    'TDX':     ('c3-',),
+}
+_CC_DEFAULT = 'SEV'
+
 
 class GCPProvider(CloudProvider):
     """Cloud provider backed by the gcloud CLI."""
@@ -66,6 +75,30 @@ class GCPProvider(CloudProvider):
 
     # ── CloudProvider interface ────────────────────────────────────────────────
 
+    def _confidential_args(self, config: VMConfig) -> List[str]:
+        """Return gcloud flags required for Confidential VM launch."""
+        if not config.confidential_compute:
+            return []
+        ctype = (config.confidential_type or _CC_DEFAULT).upper()
+        if ctype not in _CC_TYPES:
+            raise ValueError(
+                f"Unknown GCP confidential type: {ctype!r}. "
+                f"Choose from: {', '.join(_CC_TYPES)}"
+            )
+        required_prefixes = _CC_TYPES[ctype]
+        if not any(config.instance_type.startswith(p) for p in required_prefixes):
+            print(
+                f"[gcp] WARNING: Confidential type '{ctype}' requires a machine type "
+                f"starting with one of {required_prefixes}. "
+                f"Got '{config.instance_type}'. The API will reject this if incompatible."
+            )
+        print(f"[gcp] Confidential Computing enabled: type={ctype}")
+        return [
+            '--confidential-compute',
+            f'--confidential-compute-type={ctype}',
+            '--maintenance-policy=TERMINATE',  # live migration not supported for CVM
+        ]
+
     def create_vm(self, config: VMConfig) -> VMInstance:
         name = config.vm_name or f'benchmark-{uuid.uuid4().hex[:8]}'
         zone = self._zone(config.region, config.zone)
@@ -81,6 +114,7 @@ class GCPProvider(CloudProvider):
             ]
         )
 
+        cc_args = self._confidential_args(config)
         print(f"[gcp] Creating instance '{name}' in {zone} ({config.instance_type})...")
         data = self._run([
             'compute', 'instances', 'create', name,
@@ -89,7 +123,7 @@ class GCPProvider(CloudProvider):
             f'--boot-disk-size={config.disk_size_gb}GB',
             f'--metadata=ssh-keys={ssh_meta}',
             f'--labels={_LABEL}',
-        ] + image_args)
+        ] + image_args + cc_args)
 
         item = data[0] if isinstance(data, list) else data
         return self._parse_instance(item, zone, config.ssh_user, key_path)

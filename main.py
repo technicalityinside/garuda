@@ -448,6 +448,8 @@ def _build_vm_config(args):
         vm_name=getattr(args, 'vm_name', None),
         zone=getattr(args, 'gcp_zone', None),
         resource_group=getattr(args, 'azure_resource_group', None),
+        confidential_compute=getattr(args, 'confidential', False),
+        confidential_type=getattr(args, 'confidential_type', None),
     )
 
 
@@ -851,6 +853,19 @@ def build_parser() -> argparse.ArgumentParser:
                        help="Azure resource group (auto-created if omitted)")
         g.add_argument("--azure-subscription",
                        help="Azure subscription ID")
+        # Confidential Computing
+        cc = p.add_argument_group("Confidential Computing")
+        cc.add_argument("--confidential", action="store_true",
+                        help="Launch a Confidential Computing VM")
+        cc.add_argument(
+            "--confidential-type", metavar="TYPE",
+            help=(
+                "Confidential compute technology — provider-specific:\n"
+                "  GCP:   SEV (default) | SEV_SNP | TDX\n"
+                "  Azure: VMGuestStateOnly (default) | DiskWithVMGuestState\n"
+                "  AWS:   SevSnp (default) | NitroEnclave"
+            ),
+        )
 
     def _add_bench_args(p, workload_required=True):
         """Attach benchmark selection arguments to a subparser."""
