@@ -16,6 +16,10 @@ Cloud orchestration:
   cloud-exec              Run benchmarks on a previously provisioned VM
   cloud-destroy           Destroy a tracked cloud VM
   cloud-list              List tracked cloud VMs
+
+Kernel analysis:
+  kernel-analyze          Benchmark across multiple kernel versions (auto-installs,
+                          reboots, and pushes results to Kernel Ledger)
 """
 
 import argparse
@@ -1166,6 +1170,481 @@ def _print_system_snapshot(snap: dict) -> None:
         print()
 
 
+# ── Kernel analysis ────────────────────────────────────────────────────────
+
+def cmd_kernel_analyze(args, topo):
+    """
+    Orchestrate benchmark runs across multiple kernel versions.
+
+    Flow:
+      1. Parse / restore session state.
+      2. If the current kernel is the next target → benchmark it, push results.
+      3. Install the next kernel (via apt), configure GRUB for a one-time boot,
+         mark state, then reboot.  The systemd service fires this command with
+         --resume on every subsequent boot until all kernels are done.
+      4. After the last kernel: compute composite scores, print report, clean up
+         the systemd service and (optionally) the state file.
+
+    Requires root.  State is stored at /var/lib/garuda/kernel_analysis.json by
+    default so it survives across reboots.
+    """
+    import datetime
+    import platform
+
+    from kernel_analysis.state import AnalysisSession, KernelEntry, DEFAULT_STATE_FILE
+    from kernel_analysis.installer import (
+        current_kernel, is_installed, install, set_next_boot, do_reboot,
+        list_available_kernels,
+    )
+    from kernel_analysis.service import install_service, remove_service, service_status
+    from kernel_analysis.scorer import compute_scores, print_score_report
+
+    state_file = getattr(args, "state_file", None) or DEFAULT_STATE_FILE
+
+    # ── --list-kernels: show installable kernels and exit ────────────────────
+    if getattr(args, "list_kernels", False):
+        print("\nAvailable kernel images (apt-cache search):\n")
+        pkgs = list_available_kernels()
+        for p in pkgs:
+            installed = " [installed]" if is_installed(p) else ""
+            print(f"  {p}{installed}")
+        if not pkgs:
+            print("  (no results — check apt sources)")
+        return
+
+    # ── --status: show current session and exit ──────────────────────────────
+    if getattr(args, "status", False):
+        if not os.path.exists(state_file):
+            print("No active kernel analysis session.")
+            return
+        session = AnalysisSession.load(state_file)
+        print(f"\nSession: {session.session_id}  [{session.status}]")
+        print(f"  Workloads : {', '.join(session.workloads) or '(all)'}")
+        print(f"  Config    : {session.config or 'single_core'}")
+        print(f"  Iterations: {session.iterations}")
+        print(f"  Push URL  : {session.push_url or '—'}")
+        print(f"  Service   : {service_status()}")
+        print()
+        headers = ["Kernel", "Status", "Run IDs", "Error"]
+        _print_simple_table(headers, session.summary_rows())
+        return
+
+    # ── --abort: clean up and exit ───────────────────────────────────────────
+    if getattr(args, "abort", False):
+        remove_service()
+        if os.path.exists(state_file):
+            os.remove(state_file)
+            print("Aborted: state file removed and service disabled.")
+        else:
+            print("No active session found (state file not present).")
+        return
+
+    # ── Root check (required for apt / grub / reboot) ────────────────────────
+    if os.geteuid() != 0:
+        print(
+            "Error: kernel-analyze requires root privileges.\n"
+            "  Run:  sudo python3 main.py kernel-analyze ...",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
+    # ── Resume mode ───────────────────────────────────────────────────────────
+    if getattr(args, "resume", False):
+        if not os.path.exists(state_file):
+            print(f"Error: state file not found at {state_file}.", file=sys.stderr)
+            sys.exit(1)
+        session = AnalysisSession.load(state_file)
+        print(f"\n[kernel-analyze] Resuming session {session.session_id}")
+
+    # ── Start mode ────────────────────────────────────────────────────────────
+    else:
+        if os.path.exists(state_file):
+            print(
+                f"Error: an active session already exists at {state_file}.\n"
+                "  Use --status to inspect it, --resume to continue, "
+                "or --abort to discard it.",
+                file=sys.stderr,
+            )
+            sys.exit(1)
+
+        if not getattr(args, "kernels", None):
+            print("Error: --kernels is required.", file=sys.stderr)
+            sys.exit(1)
+
+        kernel_list = [k.strip() for k in args.kernels.split(",") if k.strip()]
+        if not kernel_list:
+            print("Error: --kernels produced an empty list.", file=sys.stderr)
+            sys.exit(1)
+
+        workload_list = []
+        if getattr(args, "workloads", None):
+            workload_list = [w.strip() for w in args.workloads.split(",") if w.strip()]
+
+        if not workload_list:
+            print("Error: --workloads is required (comma-separated workload names).",
+                  file=sys.stderr)
+            sys.exit(1)
+
+        ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
+        session = AnalysisSession(
+            session_id=f"kernel_analysis_{ts}",
+            kernels=[KernelEntry(version=k) for k in kernel_list],
+            workloads=workload_list,
+            config=getattr(args, "config", None),
+            iterations=getattr(args, "iterations", 3),
+            push_url=getattr(args, "push_url", None),
+            api_key=getattr(args, "api_key", "") or os.environ.get("GARUDA_API_KEY", ""),
+            system_name=getattr(args, "system_name", None) or platform.node(),
+            kernel_config_label=getattr(args, "kernel_config", "analyzed"),
+            original_kernel=current_kernel(),
+            state_file=state_file,
+        )
+
+        print(f"\n[kernel-analyze] Session: {session.session_id}")
+        print(f"  Kernels   : {', '.join(kernel_list)}")
+        print(f"  Workloads : {', '.join(workload_list)}")
+        print(f"  Config    : {session.config or 'single_core'}")
+        print(f"  Iterations: {session.iterations}")
+        if session.push_url:
+            print(f"  Push URL  : {session.push_url}")
+        print(f"  State file: {state_file}")
+        print()
+
+        if getattr(args, "dry_run", False):
+            print("[DRY RUN] Would install kernels, configure GRUB, and reboot.")
+            print("Plan:")
+            for k in kernel_list:
+                flag = " [installed]" if is_installed(k) else " [needs install]"
+                print(f"  {k}{flag}")
+            return
+
+        session.started_at = datetime.datetime.now().isoformat()
+        session.save()
+
+        # Install systemd resume service
+        ok, msg = install_service(
+            main_py=os.path.join(_ROOT, "main.py"),
+            state_file=state_file,
+        )
+        if ok:
+            print(f"  Systemd service installed: {msg}")
+        else:
+            print(f"  [WARNING] Could not install systemd service: {msg}")
+            print("  After each reboot you will need to manually run:")
+            print(f"    sudo python3 main.py kernel-analyze --resume --state-file {state_file}")
+
+    # ── Main analysis loop ────────────────────────────────────────────────────
+    _ka_loop(session, topo)
+
+
+def _ka_loop(session, topo) -> None:
+    """
+    Core state-machine loop for kernel analysis.
+    May reboot the machine — in that case the function does not return.
+    """
+    import datetime
+
+    from kernel_analysis.installer import (
+        current_kernel, is_installed, install, set_next_boot, do_reboot,
+    )
+    from kernel_analysis.service import remove_service
+    from kernel_analysis.scorer import compute_scores, print_score_report
+
+    running = current_kernel()
+
+    # ── Step 1: Benchmark the current target kernel if we're on it ────────────
+
+    # A "rebooting" entry means we set grub and rebooted (or this is the first
+    # kernel and we're already on it).  Find it and match to current kernel.
+    target = session.current_rebooting()
+
+    if target is None:
+        # First-run case: check if we're already on the first pending kernel.
+        first_pending = session.next_pending()
+        if first_pending and first_pending.version == running:
+            first_pending.status = "rebooting"
+            session.save()
+            target = first_pending
+
+    if target is not None:
+        if running != target.version:
+            print(
+                f"  [WARNING] Expected kernel {target.version} but running {running}.\n"
+                "  Benchmarking the current kernel and tagging it accordingly."
+            )
+            target.version = running   # adjust version to reality
+
+        print(f"\n[kernel-analyze] Benchmarking kernel: {running}")
+        target.status = "benchmarking"
+        target.started_at = datetime.datetime.now().isoformat()
+        session.save()
+
+        run_ids = _ka_run_workloads(session, topo)
+
+        target.run_ids = run_ids
+        target.status = "benchmarked"
+        target.completed_at = datetime.datetime.now().isoformat()
+        session.save()
+
+        # Push results to Kernel Ledger (if configured)
+        if session.push_url and run_ids:
+            _ka_push(session, target)
+            target.status = "pushed"
+        elif not session.push_url:
+            target.status = "pushed"   # treat as done even without push URL
+        session.save()
+
+        if session.all_terminal():
+            _ka_finalize(session, topo)
+            return
+
+    # ── Step 2: Set up and reboot into the next pending kernel ────────────────
+
+    next_entry = session.next_pending()
+    if next_entry is None:
+        _ka_finalize(session, topo)
+        return
+
+    print(f"\n[kernel-analyze] Next kernel: {next_entry.version}")
+
+    # Install if needed
+    if not is_installed(next_entry.version):
+        print(f"  Installing {next_entry.version} ...")
+        ok, msg = install(next_entry.version)
+        if not ok:
+            print(f"  [ERROR] {msg}")
+            next_entry.status = "failed"
+            next_entry.error = msg
+            session.save()
+            # Skip to the next one
+            _ka_loop(session, topo)
+            return
+        print(f"  {msg}")
+
+    next_entry.status = "installed"
+    session.save()
+
+    # Configure GRUB for one-time boot into next_entry
+    ok, msg = set_next_boot(next_entry.version)
+    if not ok:
+        print(f"  [ERROR] GRUB: {msg}")
+        next_entry.status = "failed"
+        next_entry.error = msg
+        session.save()
+        _ka_loop(session, topo)
+        return
+
+    print(f"  GRUB: {msg}")
+    next_entry.status = "rebooting"
+    session.save()
+
+    do_reboot(f"Switching to kernel {next_entry.version}")
+    # do_reboot() calls systemctl reboot — this line is never reached
+    sys.exit(0)
+
+
+def _ka_run_workloads(session, topo) -> List[str]:
+    """
+    Run every configured workload and return the list of run_ids.
+    Skips workloads that fail validation.
+    """
+    from benchmark_toolkit.runner import BenchmarkRunner
+    from benchmark_toolkit.collector import ResultsCollector
+    from benchmark_toolkit.config import ConfigPreset, BenchmarkConfig
+
+    run_ids = []
+
+    for wl_name in session.workloads:
+        try:
+            workload = registry.get(wl_name)
+        except KeyError:
+            print(f"  [SKIP] Unknown workload: {wl_name!r}")
+            continue
+
+        ok, msg = workload.validate()
+        if not ok:
+            print(f"  [SKIP] {wl_name}: {msg}")
+            continue
+
+        # Resolve config preset
+        if session.config:
+            presets = ConfigPreset.all_presets(topo)
+            if session.config in presets:
+                config = presets[session.config]
+            else:
+                print(f"  [WARN] Preset {session.config!r} not found; using single_core.")
+                config = ConfigPreset.single_core(topo)
+        else:
+            config = ConfigPreset.single_core(topo)
+
+        config.iterations = session.iterations
+        if session.workload_args:
+            config.workload_args = session.workload_args
+
+        runner = BenchmarkRunner(
+            work_dir="/tmp/benchmark_toolkit",
+            bin_dir=BIN_DIR,
+        )
+        collector = ResultsCollector(results_dir=RESULTS_DIR)
+
+        print(f"  Running: {wl_name} / {config.name} / {session.iterations} iter(s)")
+        results = runner.run(workload, config)
+        run_id = collector.save(results)
+        run_ids.append(run_id)
+
+        n_ok = sum(1 for r in results if r.success)
+        print(f"    {n_ok}/{session.iterations} OK  run_id={run_id}")
+
+    return run_ids
+
+
+def _ka_push(session, entry) -> None:
+    """Push all run_ids for a kernel entry to the Kernel Ledger."""
+    import json
+    import platform
+    import subprocess
+    import urllib.request
+    import urllib.error
+
+    cpu_model = "unknown"
+    try:
+        out = subprocess.run(["lscpu"], capture_output=True, text=True, timeout=5).stdout
+        for line in out.splitlines():
+            if line.startswith("Model name:"):
+                cpu_model = line.split(":", 1)[1].strip()
+                break
+    except Exception:
+        pass
+
+    memory_gb = None
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemTotal:"):
+                memory_gb = int(line.split()[1]) // (1024 * 1024)
+                break
+    except Exception:
+        pass
+
+    _topo = None
+    try:
+        _topo = _get_topology()
+        numa_nodes = _topo.total_numa_nodes
+    except Exception:
+        numa_nodes = 1
+
+    system_payload = {
+        "name":       session.system_name,
+        "cpu_model":  cpu_model,
+        "arch":       platform.machine(),
+        "memory_gb":  memory_gb,
+        "numa_nodes": numa_nodes,
+    }
+    kernel_payload = {
+        "version":     entry.version,
+        "config_name": session.kernel_config_label,
+    }
+
+    snap = collect_system_snapshot(_topo)
+    url = session.push_url.rstrip("/") + "/api/runs"
+    pushed = 0
+
+    for run_id in entry.run_ids:
+        results_file = os.path.join(RESULTS_DIR, run_id, "results.json")
+        if not os.path.exists(results_file):
+            print(f"    [WARN] results.json not found for run {run_id}")
+            continue
+
+        with open(results_file) as f:
+            saved = json.load(f)
+
+        groups: Dict = {}
+        for item in saved.get("results", []):
+            key = (item.get("workload", "unknown"), item.get("config_name") or "")
+            groups.setdefault(key, []).append(item)
+
+        for (workload, config_preset), items in groups.items():
+            entries = []
+            for item in items:
+                for metric, value in (item.get("metrics") or {}).items():
+                    try:
+                        entries.append({
+                            "metric_name": metric,
+                            "value":       float(value),
+                            "iteration":   item.get("iteration", 0),
+                        })
+                    except (TypeError, ValueError):
+                        pass
+
+            if not entries:
+                continue
+
+            payload = {
+                "system":          system_payload,
+                "kernel":          kernel_payload,
+                "workload":        workload,
+                "config_preset":   config_preset or None,
+                "workload_args":   items[0].get("workload_args", {}),
+                "ran_at":          items[0].get("timestamp") or saved.get("timestamp"),
+                "system_snapshot": snap,
+                "results":         entries,
+            }
+
+            data = json.dumps(payload, default=str).encode()
+            headers = {"Content-Type": "application/json"}
+            if session.api_key:
+                headers["Authorization"] = f"Bearer {session.api_key}"
+
+            req = urllib.request.Request(url, data=data, headers=headers, method="POST")
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    body = json.loads(resp.read())
+                    print(f"    pushed {workload}/{config_preset or 'default'}"
+                          f"  run_id={body['run_id']}")
+                    pushed += 1
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode(errors="replace")
+                print(f"    [WARN] HTTP {exc.code}: {detail}")
+            except Exception as exc:
+                print(f"    [WARN] push failed: {exc}")
+
+    print(f"  Pushed {pushed} group(s) to {session.push_url}")
+
+
+def _ka_finalize(session, topo) -> None:
+    """Compute scores, print report, clean up service and state file."""
+    import datetime
+
+    from kernel_analysis.service import remove_service
+    from kernel_analysis.scorer import compute_scores, print_score_report
+
+    print("\n[kernel-analyze] All kernels complete. Computing scores...")
+
+    scores = compute_scores(
+        results_dir=RESULTS_DIR,
+        kernel_entries=session.kernels,
+        workloads=session.workloads or None,
+    )
+
+    # Store scores back into each kernel entry
+    for entry in session.kernels:
+        if entry.version in scores:
+            entry.scores = {
+                "composite": scores[entry.version]["score"],
+            }
+
+    session.status = "done"
+    session.completed_at = datetime.datetime.now().isoformat()
+    session.save()
+
+    print_score_report(session.kernels, scores)
+
+    # Remove resume service now that we're done
+    remove_service()
+
+    print(f"\n  State file retained at: {session.state_file}")
+    print("  Run with --status to review, or --abort to clean up.")
+
+
 # ── Table printing helpers ──────────────────────────────────────────────────
 
 def _print_simple_table(headers: List[str], rows: List[List[str]]) -> None:
@@ -1548,6 +2027,112 @@ def build_parser() -> argparse.ArgumentParser:
         help="Push API key for the portal (default: $GARUDA_API_KEY env var)",
     )
 
+    # ── kernel-analyze ────────────────────────────────────────────────────────
+    p_ka = subparsers.add_parser(
+        "kernel-analyze",
+        help="Benchmark workloads across multiple kernel versions, push to Kernel Ledger",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            Requires root (sudo).  Installs kernels via apt, uses grub-reboot for
+            one-time boot switching, and installs a systemd service that auto-resumes
+            after each reboot.
+
+            Examples:
+              # Analyze three kernels, run fio + stream, push results
+              sudo python3 main.py kernel-analyze \\
+                --kernels 6.8.0-55-generic,6.11.0-25-generic,6.12.0-10-generic \\
+                --workloads fio,stream \\
+                --iterations 5 \\
+                --push-url http://localhost:8000 \\
+                --api-key my-secret-key
+
+              # Use a specific config preset and custom kernel label
+              sudo python3 main.py kernel-analyze \\
+                --kernels 6.8.0-55-generic,6.12.0-10-generic \\
+                --workloads hackbench,schbench,stream \\
+                --config 4c4t --iterations 3 \\
+                --kernel-config distro-ubuntu \\
+                --push-url http://perf.example.com
+
+              # Dry run to see the plan without touching anything
+              sudo python3 main.py kernel-analyze \\
+                --kernels 6.8.0-55-generic,6.12.0-10-generic \\
+                --workloads fio --dry-run
+
+              # Show current session state
+              sudo python3 main.py kernel-analyze --status
+
+              # Abort an in-progress session
+              sudo python3 main.py kernel-analyze --abort
+
+              # List kernel packages available to install
+              python3 main.py kernel-analyze --list-kernels
+        """),
+    )
+
+    ka_mode = p_ka.add_mutually_exclusive_group()
+    ka_mode.add_argument(
+        "--resume", action="store_true",
+        help="Resume an in-progress session (called automatically by the systemd service)",
+    )
+    ka_mode.add_argument(
+        "--status", action="store_true",
+        help="Show the state of the current analysis session and exit",
+    )
+    ka_mode.add_argument(
+        "--abort", action="store_true",
+        help="Abort the current session: disable the service and remove state",
+    )
+    ka_mode.add_argument(
+        "--list-kernels", action="store_true",
+        help="List kernel packages available via apt and exit",
+    )
+
+    p_ka.add_argument(
+        "--kernels", metavar="VER,VER,...",
+        help="Comma-separated kernel version strings to test, e.g. "
+             "6.8.0-55-generic,6.12.0-10-generic",
+    )
+    p_ka.add_argument(
+        "--workloads", metavar="NAME,NAME,...",
+        help="Comma-separated workload names to run on each kernel "
+             "(see list-workloads for available names)",
+    )
+    p_ka.add_argument(
+        "--config", metavar="PRESET",
+        help="Config preset name for each workload run (default: single_core)",
+    )
+    p_ka.add_argument(
+        "--iterations", type=int, default=3, metavar="N",
+        help="Iterations per workload per kernel (default: 3)",
+    )
+    p_ka.add_argument(
+        "--push-url", metavar="URL",
+        help="Kernel Ledger base URL to push results to (e.g. http://localhost:8000)",
+    )
+    p_ka.add_argument(
+        "--api-key", metavar="KEY",
+        default=os.environ.get("GARUDA_API_KEY", ""),
+        help="Kernel Ledger push API key (default: $GARUDA_API_KEY)",
+    )
+    p_ka.add_argument(
+        "--system-name", metavar="NAME",
+        help="Override system name in the ledger (default: hostname)",
+    )
+    p_ka.add_argument(
+        "--kernel-config", metavar="LABEL", default="analyzed",
+        help="Kernel config label stored in the ledger (default: analyzed)",
+    )
+    p_ka.add_argument(
+        "--state-file", metavar="PATH",
+        default="/var/lib/garuda/kernel_analysis.json",
+        help="Path to the session state file (default: /var/lib/garuda/kernel_analysis.json)",
+    )
+    p_ka.add_argument(
+        "--dry-run", action="store_true",
+        help="Print the analysis plan without installing kernels or rebooting",
+    )
+
     return parser
 
 
@@ -1600,7 +2185,8 @@ def main():
         "cloud-exec": cmd_cloud_exec,
         "cloud-destroy": cmd_cloud_destroy,
         "cloud-list":    cmd_cloud_list,
-        "push":          cmd_push,
+        "push":           cmd_push,
+        "kernel-analyze": cmd_kernel_analyze,
     }
 
     handler = dispatch.get(args.command)
