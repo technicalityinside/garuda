@@ -630,6 +630,139 @@ def cmd_cloud_list(args, topo):
     print(f"\n{len(vms)} tracked VM(s).  State shown is from provisioning time.")
 
 
+# ── Cloud kernel analysis ─────────────────────────────────────────────────
+
+def cmd_cloud_kernel_analyze(args, topo):
+    """
+    Provision a cloud VM, run kernel-analyze across multiple kernel versions,
+    poll via SSH until complete (reconnecting across reboots), fetch results,
+    then destroy the VM.
+
+    This is the cloud equivalent of `kernel-analyze`:
+      - All kernels are pre-installed via apt before the first reboot cycle
+      - The systemd service on the VM handles grub-reboot and auto-resume
+      - The orchestrator polls the remote state file every 30 s
+      - Results are fetched and optionally pushed to Kernel Ledger from here
+
+    Requires: same cloud provider credentials as cloud-run.
+    """
+    from orchestrator import get_provider
+    from orchestrator.runner import CloudBenchmarkRunner
+    from orchestrator.state import VMStateStore
+
+    from kernel_analysis.scorer import compute_scores, print_score_report
+    from kernel_analysis.state import AnalysisSession
+
+    vm_config = _build_vm_config(args)
+    provider = get_provider(args.provider, **_provider_kwargs(args))
+    runner = CloudBenchmarkRunner(provider)
+    store = VMStateStore()
+
+    # Kernel list
+    kernel_list = [k.strip() for k in args.kernels.split(",") if k.strip()]
+    if not kernel_list:
+        print("Error: --kernels produced an empty list.", file=sys.stderr)
+        sys.exit(1)
+
+    # Workload list
+    workload_list = [w.strip() for w in args.workloads.split(",") if w.strip()]
+    if not workload_list:
+        print("Error: --workloads is required.", file=sys.stderr)
+        sys.exit(1)
+
+    api_key = args.api_key or os.environ.get("GARUDA_API_KEY", "")
+
+    print(f"\n[cloud-kernel-analyze] Starting kernel analysis")
+    print(f"  Kernels   : {', '.join(kernel_list)}")
+    print(f"  Workloads : {', '.join(workload_list)}")
+    print(f"  Config    : {args.config or 'single_core'}")
+    print(f"  Iterations: {args.iterations}")
+    if args.push_url:
+        print(f"  Push URL  : {args.push_url}")
+    print()
+
+    instance = None
+    status = "unknown"
+    try:
+        # Provision VM
+        instance = runner.provision(vm_config, verbose=args.verbose)
+        if args.no_teardown:
+            store.save(instance)
+            print(f"[cloud] VM tracked as '{instance.name}'")
+
+        # Deploy toolkit
+        runner.setup_toolkit(instance, _ROOT, args.verbose)
+
+        # Run the full kernel analysis pipeline
+        status = runner.run_kernel_analysis(
+            instance=instance,
+            kernels=kernel_list,
+            workloads=workload_list,
+            config=args.config,
+            iterations=args.iterations,
+            push_url=args.push_url,
+            api_key=api_key,
+            kernel_config=args.kernel_config,
+            local_results_dir=RESULTS_DIR,
+            verbose=args.verbose,
+            poll_interval=args.poll_interval,
+        )
+
+    except Exception as exc:
+        print(f"\n[cloud-kernel-analyze] Error: {exc}", file=sys.stderr)
+        if instance and not args.no_teardown:
+            print("[cloud] Attempting VM cleanup ...", file=sys.stderr)
+            try:
+                runner.destroy(instance)
+            except Exception as exc2:
+                print(f"[cloud] Cleanup failed: {exc2}", file=sys.stderr)
+        sys.exit(1)
+
+    # Print local score report (from fetched state file)
+    _ka_print_local_scores()
+
+    if args.no_teardown:
+        print(
+            f"\n[cloud] VM kept running (use 'cloud-destroy --vm-name {instance.name}')."
+        )
+    else:
+        runner.destroy(instance)
+        if args.no_teardown:
+            store.remove(instance.name)
+
+    if status == "failed":
+        print("[cloud-kernel-analyze] Analysis reported failures — check results.", file=sys.stderr)
+        sys.exit(1)
+    print(f"\n[cloud-kernel-analyze] Done. Results in {RESULTS_DIR}/")
+
+
+def _ka_print_local_scores():
+    """
+    After fetching results, read the state file and print the score report
+    using local results so the operator sees a summary without connecting to the VM.
+    """
+    import glob
+
+    from kernel_analysis.scorer import compute_scores, print_score_report
+    from kernel_analysis.state import AnalysisSession
+
+    # Look for a state file that was fetched alongside results
+    candidates = glob.glob(os.path.join(RESULTS_DIR, "kernel_analysis.json"))
+    if not candidates:
+        return
+
+    try:
+        session = AnalysisSession.load(candidates[0])
+        scores = compute_scores(
+            results_dir=RESULTS_DIR,
+            kernel_entries=session.kernels,
+            workloads=session.workloads or None,
+        )
+        print_score_report(session.kernels, scores)
+    except Exception as exc:
+        print(f"[cloud] Could not compute score report: {exc}")
+
+
 # ── Portal push ────────────────────────────────────────────────────────────
 
 def cmd_push(args, topo):
@@ -2027,6 +2160,79 @@ def build_parser() -> argparse.ArgumentParser:
         help="Push API key for the portal (default: $GARUDA_API_KEY env var)",
     )
 
+    # ── cloud-kernel-analyze ─────────────────────────────────────────────────
+    p_cka = subparsers.add_parser(
+        "cloud-kernel-analyze",
+        help="Provision a cloud VM and run kernel-analyze across multiple kernel versions",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            Provisions a single VM, pre-installs all kernels via apt, then runs
+            kernel-analyze on the VM.  A systemd service on the VM handles grub-reboot
+            and auto-resume after each kernel switch.  The orchestrator polls SSH every
+            30 s, reconnecting transparently across reboots, until all kernels are done.
+            Results are fetched locally and a composite score report is printed.
+
+            Examples:
+              # GCP — three kernels, fio + stream, auto-push to Kernel Ledger
+              python main.py cloud-kernel-analyze --provider gcp --region us-central1 \\
+                --instance-type n2-standard-4 \\
+                --kernels 6.8.0-55-generic,6.11.0-25-generic,6.12.0-10-generic \\
+                --workloads fio,stream --iterations 5 \\
+                --push-url http://perf.example.com --api-key my-key
+
+              # AWS — keep VM running after analysis
+              python main.py cloud-kernel-analyze --provider aws --region us-east-1 \\
+                --instance-type m5.xlarge --aws-key-name my-keypair \\
+                --kernels 6.8.0-55-generic,6.12.0-10-generic \\
+                --workloads hackbench,schbench,stream \\
+                --config 4c4t --iterations 3 --no-teardown
+        """),
+    )
+    _add_vm_args(p_cka)
+    p_cka.add_argument(
+        "--kernels", required=True, metavar="VER,VER,...",
+        help="Comma-separated kernel version strings to test, "
+             "e.g. 6.8.0-55-generic,6.12.0-10-generic",
+    )
+    p_cka.add_argument(
+        "--workloads", required=True, metavar="NAME,NAME,...",
+        help="Comma-separated workload names to run on each kernel "
+             "(see list-workloads for options)",
+    )
+    p_cka.add_argument(
+        "--config", metavar="PRESET",
+        help="Config preset for each workload run (default: single_core)",
+    )
+    p_cka.add_argument(
+        "--iterations", type=int, default=3, metavar="N",
+        help="Iterations per workload per kernel (default: 3)",
+    )
+    p_cka.add_argument(
+        "--push-url", metavar="URL",
+        help="Kernel Ledger base URL to push results to (e.g. http://perf.example.com)",
+    )
+    p_cka.add_argument(
+        "--api-key", metavar="KEY",
+        default=os.environ.get("GARUDA_API_KEY", ""),
+        help="Kernel Ledger push API key (default: $GARUDA_API_KEY)",
+    )
+    p_cka.add_argument(
+        "--kernel-config", metavar="LABEL", default="analyzed",
+        help="Kernel config label stored in the ledger (default: analyzed)",
+    )
+    p_cka.add_argument(
+        "--poll-interval", type=int, default=30, metavar="SECONDS",
+        help="How often to poll the VM for analysis status (default: 30s)",
+    )
+    p_cka.add_argument(
+        "--no-teardown", action="store_true",
+        help="Keep the VM running after the analysis (tracked by cloud-list)",
+    )
+    p_cka.add_argument(
+        "--verbose", action="store_true",
+        help="Print detailed output from remote commands",
+    )
+
     # ── kernel-analyze ────────────────────────────────────────────────────────
     p_ka = subparsers.add_parser(
         "kernel-analyze",
@@ -2185,8 +2391,9 @@ def main():
         "cloud-exec": cmd_cloud_exec,
         "cloud-destroy": cmd_cloud_destroy,
         "cloud-list":    cmd_cloud_list,
-        "push":           cmd_push,
-        "kernel-analyze": cmd_kernel_analyze,
+        "push":                  cmd_push,
+        "kernel-analyze":        cmd_kernel_analyze,
+        "cloud-kernel-analyze":  cmd_cloud_kernel_analyze,
     }
 
     handler = dispatch.get(args.command)
