@@ -6,6 +6,8 @@ Includes dedicated benchmarks for every major Linux kernel subsystem: scheduler 
 
 A cloud orchestrator layer sits on top: it can provision a VM on **Google Cloud (GCP)**, **Microsoft Azure**, or **Amazon AWS**, deploy the toolkit over SSH, run the benchmarks remotely, stream results back, and optionally tear down the VM — all from a single command.
 
+A **kernel analysis layer** sits on top of everything: `kernel-analyze` installs multiple kernel versions, reboots into each one automatically using a systemd service, runs the full workload suite, and pushes results to the [Garuda Kernel Ledger](portal/README.md). `cloud-kernel-analyze` does the same on a cloud VM, polling via SSH across reboots until all kernels are benchmarked, then fetches results and prints a composite score report.
+
 ---
 
 ## Requirements
@@ -59,6 +61,11 @@ tools/
 │   ├── remote.py               # RemoteExecutor — SSH + rsync
 │   ├── runner.py               # CloudBenchmarkRunner — end-to-end lifecycle
 │   └── state.py                # VMStateStore — persists VM info locally
+├── kernel_analysis/            # Multi-kernel benchmarking layer
+│   ├── state.py                # AnalysisSession + KernelEntry — persisted JSON state machine
+│   ├── installer.py            # apt kernel install, grub.cfg parser, grub-reboot
+│   ├── scorer.py               # Composite score computation + formatted report
+│   └── service.py              # Systemd oneshot service install/remove
 ├── workloads/                  # Drop new .py files here to add workloads
 │   ├── python_bench.py         # Pure Python (always works, no deps)
 │   ├── sysbench.py             # sysbench CPU
@@ -109,6 +116,55 @@ python3 main.py scaling --workload python_bench --configs 1c1t,1c2t,2c2t,2c4t
 # 7. List and inspect saved results
 python3 main.py report --list
 python3 main.py report --run-id <run_id>
+```
+
+### Kernel analysis (local)
+
+Automatically install and benchmark across multiple kernel versions. Requires root — uses `grub-reboot` and a systemd service to survive across reboots.
+
+```bash
+# Benchmark three kernel versions on fio + stream, push to Kernel Ledger
+sudo python3 main.py kernel-analyze \
+  --kernels 6.8.0-55-generic,6.11.0-25-generic,6.12.0-10-generic \
+  --workloads fio,stream,hackbench \
+  --iterations 5 \
+  --push-url http://perf.example.com \
+  --api-key my-secret-key
+
+# Dry run — see the plan without touching anything
+sudo python3 main.py kernel-analyze \
+  --kernels 6.8.0-55-generic,6.12.0-10-generic \
+  --workloads fio --dry-run
+
+# Check status of an in-progress analysis
+sudo python3 main.py kernel-analyze --status
+
+# Abort a running analysis
+sudo python3 main.py kernel-analyze --abort
+```
+
+After all kernels complete, a score report is printed. Baseline kernel = 100; higher is better.
+
+### Kernel analysis (cloud)
+
+Same pipeline on a cloud VM — the orchestrator polls SSH every 30 s and reconnects transparently across reboots.
+
+```bash
+# GCP — three kernels, auto-push to Kernel Ledger
+python3 main.py cloud-kernel-analyze \
+  --provider gcp --region us-central1 --instance-type n2-standard-4 \
+  --kernels 6.8.0-55-generic,6.11.0-25-generic,6.12.0-10-generic \
+  --workloads fio,stream,hackbench \
+  --iterations 5 \
+  --push-url http://perf.example.com --api-key my-key
+
+# AWS — keep VM running after analysis (for manual inspection)
+python3 main.py cloud-kernel-analyze \
+  --provider aws --region us-east-1 \
+  --instance-type m5.xlarge --aws-key-name my-keypair \
+  --kernels 6.8.0-55-generic,6.12.0-10-generic \
+  --workloads hackbench,schbench,stream \
+  --config 4c4t --iterations 3 --no-teardown
 ```
 
 ### Cloud benchmarks
@@ -1270,6 +1326,193 @@ The `results.json` schema:
   "num_results": 3,
   "num_successful": 3
 }
+```
+
+---
+
+## Kernel Analysis
+
+The kernel analysis layer automates cross-kernel performance comparisons. It installs each kernel via `apt`, configures GRUB for a one-time boot (`grub-reboot`), runs the full workload suite after each reboot, and pushes results to the Kernel Ledger. A systemd service handles auto-resume so the workflow survives reboots without manual intervention.
+
+Scores are computed after all kernels complete using a geometric mean of normalised per-metric values. The baseline kernel (first in the list) scores 100; other kernels are shown relative to it.
+
+---
+
+### `kernel-analyze`
+
+Run benchmarks across multiple kernel versions on the local machine. Requires `root` for `apt`, `grub-reboot`, and `systemctl reboot`.
+
+```bash
+sudo python3 main.py kernel-analyze \
+  --kernels VER,VER,... --workloads NAME,NAME,... \
+  [--config PRESET] [--iterations N] \
+  [--push-url URL] [--api-key KEY] [--kernel-config LABEL] \
+  [--system-name NAME] [--state-file PATH] [--dry-run]
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--kernels VER,...` | (required) | Comma-separated kernel versions, e.g. `6.8.0-55-generic,6.12.0-10-generic` |
+| `--workloads NAME,...` | (required) | Comma-separated workload names to run on each kernel |
+| `--config PRESET` | `single_core` | Config preset for each workload run (see `list-configs`) |
+| `--iterations N` | `3` | Iterations per workload per kernel |
+| `--push-url URL` | — | Kernel Ledger base URL; results are pushed after each kernel |
+| `--api-key KEY` | `$GARUDA_API_KEY` | Ledger push API key |
+| `--kernel-config LABEL` | `analyzed` | Label stored in the ledger (e.g. `distro-ubuntu`, `defconfig`) |
+| `--system-name NAME` | hostname | Override the system name in the ledger |
+| `--state-file PATH` | `/var/lib/garuda/kernel_analysis.json` | State file path (survives reboots) |
+| `--dry-run` | off | Print the plan without installing or rebooting |
+| `--status` | — | Show current session state and exit |
+| `--abort` | — | Disable the systemd service and remove the state file |
+| `--resume` | — | Resume an in-progress session (called automatically by systemd) |
+| `--list-kernels` | — | Show kernel packages available via apt and exit |
+
+**How it works:**
+
+```
+sudo python3 main.py kernel-analyze --kernels 6.8,6.11,6.12 --workloads fio,stream
+  │
+  ├─ Creates state file at /var/lib/garuda/kernel_analysis.json
+  ├─ Installs garuda-kernel-analysis.service (systemd oneshot)
+  │
+  ├─ [kernel 6.8.0-55-generic — already running]
+  │   ├─ Benchmarks fio, stream
+  │   ├─ Pushes results to Kernel Ledger
+  │   └─ grub-reboot → reboot into 6.11
+  │
+  ├─ [boot] systemd fires kernel-analyze --resume
+  │   ├─ Benchmarks fio, stream on 6.11
+  │   ├─ Pushes results
+  │   └─ grub-reboot → reboot into 6.12
+  │
+  └─ [boot] systemd fires kernel-analyze --resume
+      ├─ Benchmarks fio, stream on 6.12
+      ├─ Pushes results
+      ├─ Prints composite score report
+      └─ Removes systemd service
+```
+
+**Examples:**
+
+```bash
+# Three kernels, scheduler + memory workloads, 5 iterations, 4-core config
+sudo python3 main.py kernel-analyze \
+  --kernels 6.8.0-55-generic,6.11.0-25-generic,6.12.0-10-generic \
+  --workloads schbench,hackbench,stream,mem_lat \
+  --config 4c4t --iterations 5 \
+  --push-url http://localhost:8000 --api-key my-key \
+  --kernel-config distro-ubuntu
+
+# See what kernels are available to install
+python3 main.py kernel-analyze --list-kernels
+
+# Dry run — shows which kernels need installation
+sudo python3 main.py kernel-analyze \
+  --kernels 6.8.0-55-generic,6.12.0-10-generic --workloads fio --dry-run
+
+# Check progress mid-analysis
+sudo python3 main.py kernel-analyze --status
+```
+
+**Score report (printed after all kernels complete):**
+
+```
+════════════════════════════════════════════════════════════════════════
+  KERNEL ANALYSIS — COMPOSITE SCORES  (baseline = 100)
+════════════════════════════════════════════════════════════════════════
+  Kernel                              Score   vs baseline    vs prev
+  ────────────────────────────────────────────────────────────────────
+  6.8.0-55-generic                    100.0      baseline          —  [baseline]
+  6.11.0-25-generic                   103.4        +3.4%       +3.4%  ▲ better
+  6.12.0-10-generic                    98.1        -1.9%       -5.1%  ▼ worse
+
+  Per-workload scores (100 = baseline):
+  ────────────────────────────────────────────────────────────────────
+  fio                    6.8.0-55-generic: 100.0 | 6.11.0-25-generic: 107.2 | 6.12.0-10-generic: 99.3
+  stream                 6.8.0-55-generic: 100.0 | 6.11.0-25-generic: 100.8 | 6.12.0-10-generic: 97.4
+════════════════════════════════════════════════════════════════════════
+```
+
+---
+
+### `cloud-kernel-analyze`
+
+Same pipeline as `kernel-analyze` but on a cloud VM. The orchestrator pre-installs all kernels before the first reboot, then polls SSH every 30 s — reconnecting transparently when the VM is unreachable during reboots — until the analysis completes. Results are fetched locally at the end.
+
+```bash
+python3 main.py cloud-kernel-analyze \
+  --provider PROVIDER --region REGION --instance-type TYPE \
+  --kernels VER,VER,... --workloads NAME,NAME,... \
+  [--config PRESET] [--iterations N] \
+  [--push-url URL] [--api-key KEY] [--kernel-config LABEL] \
+  [--poll-interval SECONDS] [--no-teardown] [--verbose]
+```
+
+Accepts all standard `--provider` / VM configuration flags (same as `cloud-run`). See [Common VM arguments](#common-vm-arguments).
+
+| Flag | Default | Description |
+|---|---|---|
+| `--kernels VER,...` | (required) | Comma-separated kernel versions to test |
+| `--workloads NAME,...` | (required) | Comma-separated workload names |
+| `--config PRESET` | `single_core` | Config preset for workload runs |
+| `--iterations N` | `3` | Iterations per workload per kernel |
+| `--push-url URL` | — | Kernel Ledger URL; the VM pushes directly after each kernel |
+| `--api-key KEY` | `$GARUDA_API_KEY` | Ledger push API key |
+| `--kernel-config LABEL` | `analyzed` | Label stored in the ledger |
+| `--poll-interval SECONDS` | `30` | SSH poll frequency |
+| `--no-teardown` | off | Keep the VM running after analysis (tracked by `cloud-list`) |
+| `--verbose` | off | Print detailed remote command output |
+
+**How it works:**
+
+```
+python3 main.py cloud-kernel-analyze --provider gcp ...
+  │
+  ├─ Provision VM (GCP/AWS/Azure)
+  ├─ Deploy toolkit via rsync
+  ├─ Pre-install all kernels via apt (avoids download stalls mid-reboot)
+  ├─ Setup workload binaries
+  │
+  ├─ Launch: sudo python3 main.py kernel-analyze ... (on VM)
+  │   └─ VM installs systemd service, sets grub-reboot, reboots
+  │
+  ├─ [orchestrator] poll SSH every 30 s
+  │   ├─ VM unreachable (rebooting) → retry silently
+  │   ├─ VM back up → read state file → print progress
+  │   └─ Repeat until status = "done" or "failed"
+  │
+  ├─ Fetch results/ via rsync
+  ├─ Fetch state file via SSH cat
+  ├─ Print composite score report (from local data)
+  └─ Destroy VM (or --no-teardown to keep it)
+```
+
+**Examples:**
+
+```bash
+# GCP — three kernels, full scheduler + memory suite, auto-push
+python3 main.py cloud-kernel-analyze \
+  --provider gcp --region us-central1 --instance-type n2-standard-8 \
+  --kernels 6.8.0-55-generic,6.11.0-25-generic,6.12.0-10-generic \
+  --workloads schbench,hackbench,stream,fio,mem_lat \
+  --config 4c4t --iterations 5 \
+  --push-url http://perf.example.com --api-key my-key \
+  --kernel-config cloud-gcp-n2
+
+# AWS — two kernels, keep VM for inspection afterwards
+python3 main.py cloud-kernel-analyze \
+  --provider aws --region us-east-1 \
+  --instance-type m5.xlarge --aws-key-name my-keypair \
+  --kernels 6.8.0-55-generic,6.12.0-10-generic \
+  --workloads hackbench,schbench,stream \
+  --config 4c4t --iterations 3 --no-teardown
+
+# Azure — verbose output, fast poll
+python3 main.py cloud-kernel-analyze \
+  --provider azure --region eastus --instance-type Standard_D8s_v3 \
+  --kernels 6.8.0-55-generic,6.11.0-25-generic \
+  --workloads fio,stream --iterations 5 \
+  --poll-interval 15 --verbose
 ```
 
 ---
