@@ -1274,6 +1274,87 @@ The `results.json` schema:
 
 ---
 
+## Garuda Kernel Ledger
+
+The Garuda Kernel Ledger is a companion web portal for storing and comparing benchmark results across kernel versions, hardware configurations, and system setups. After running any workload locally or in the cloud, push results to the portal with the `push` subcommand.
+
+### Pushing results
+
+```bash
+# Set the API key (generated when deploying the portal)
+export GARUDA_API_KEY="your-api-key"
+
+# Push the most recent run
+python3 main.py push --url http://perf.example.com
+
+# Push a specific run with an explicit kernel label
+python3 main.py push --url http://perf.example.com \
+  --run-id 20260510_093347_hackbench_single_core \
+  --kernel 6.12.0 \
+  --kernel-config defconfig
+```
+
+The push command auto-detects system and kernel information and captures a full snapshot of the kernel configuration at push time — CPU frequency governor, THP policy, scheduler knobs, NUMA balancing, security mitigations, and more. This snapshot is stored alongside the results and is visible in the portal's run detail view.
+
+### Push flags
+
+| Flag | Default | Description |
+|---|---|---|
+| `--url` | (required) | Base URL of the portal |
+| `--run-id` | most recent run | Run directory to push |
+| `--system-name` | hostname | Override the system name |
+| `--kernel` | `uname -r` | Override the kernel version string |
+| `--kernel-config` | `unknown` | Kernel config label (e.g. `defconfig`, `distro-ubuntu`) |
+| `--api-key` | `$GARUDA_API_KEY` | Push authentication key |
+
+### Run report
+
+After each run, the terminal prints a full system report alongside the metric summary:
+
+```
+System
+  Host     : lab-server-01
+  Kernel   : 6.17.0-23-generic
+  CPU      : AMD Ryzen 9 9950X 16-Core Processor
+  Topology : 1 socket(s), 16 physical cores, 32 logical CPUs, 1 NUMA node(s)
+  SMT      : enabled (2x per core)
+  Memory   : 30.4 GB
+
+CPU power & frequency
+  pstate driver   : amd-pstate-epp
+  governor        : powersave
+  boost (turbo)   : enabled
+  EPP             : balance_performance
+  C-states (cpu0) : POLL(on,0us)  C1(on,1us)  C2(on,18us)  C3(on,350us)
+
+Scheduler
+  preempt model   : PREEMPT_DYNAMIC
+  NUMA balancing  : off
+  RT period (us)  : 1000000
+  ...
+
+Memory / VM       THP / hugepages / overcommit / swappiness / dirty ratios ...
+CPU isolation     isolated CPUs / nohz_full / rcu_nocbs / IRQ affinity ...
+I/O schedulers    per block device
+Network           TCP congestion / buffer sizes / SACK ...
+Kernel / boot     RCU / NMI watchdog / full cmdline ...
+Security          active mitigations + not-affected summary
+```
+
+### Portal pages
+
+| Page | Description |
+|---|---|
+| **Compare** | Line chart of a metric across kernel versions with min/max error bars and a Δ% table |
+| **Regressions** | Heatmap of workload/metric × kernel-transition cells, colour-coded red/green |
+| **Systems** | Bar chart comparing the same metric across different machines on one kernel |
+| **Runs** | Filterable table of all ingested runs; click a row to open the detail view |
+| **Run detail** | Full report: metrics table with per-iteration values, complete kernel snapshot |
+
+See the [portal README](portal/README.md) for deployment instructions.
+
+---
+
 ## Adding a Workload
 
 1. Create a new file in `workloads/`, e.g. `workloads/my_bench.py`.
