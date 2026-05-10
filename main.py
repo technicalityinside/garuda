@@ -224,9 +224,12 @@ def cmd_run(args, topo):
     n_ok = sum(1 for r in results if r.success)
     print(f"\nRun: {workload.name} / {config.name} / {config.iterations} iteration(s)")
     print(f"  {n_ok}/{config.iterations} successful  |  run_id: {run_id}")
+    print()
+
+    snap = collect_system_snapshot(topo)
+    _print_system_snapshot(snap)
 
     if summary:
-        print()
         _print_run_summary_table(workload.name, config.name, config.iterations, summary)
     else:
         print("  (no successful results)")
@@ -623,6 +626,546 @@ def cmd_cloud_list(args, topo):
     print(f"\n{len(vms)} tracked VM(s).  State shown is from provisioning time.")
 
 
+# ── Portal push ────────────────────────────────────────────────────────────
+
+def cmd_push(args, topo):
+    """Push saved benchmark results to a Garuda portal instance."""
+    import json
+    import platform
+    import subprocess
+    import urllib.error
+    import urllib.request
+
+    results_root = os.path.join(_ROOT, "results")
+
+    # Resolve which run to push
+    if args.run_id:
+        run_dirs = [os.path.join(results_root, args.run_id)]
+    else:
+        if not os.path.isdir(results_root):
+            print("No results/ directory found.", file=sys.stderr)
+            sys.exit(1)
+        candidates = sorted(
+            (d for d in os.listdir(results_root)
+             if os.path.isfile(os.path.join(results_root, d, "results.json"))),
+            key=lambda d: os.path.getmtime(os.path.join(results_root, d, "results.json"))
+        )
+        if not candidates:
+            print("No saved runs found in results/.", file=sys.stderr)
+            sys.exit(1)
+        run_dirs = [os.path.join(results_root, candidates[-1])]
+        print(f"Using most recent run: {candidates[-1]}")
+
+    # Gather system info
+    cpu_model = "unknown"
+    try:
+        out = subprocess.run(["lscpu"], capture_output=True, text=True, timeout=5).stdout
+        for line in out.splitlines():
+            if line.startswith("Model name:"):
+                cpu_model = line.split(":", 1)[1].strip()
+                break
+    except Exception:
+        pass
+
+    memory_gb = None
+    try:
+        with open("/proc/meminfo") as fh:
+            for line in fh:
+                if line.startswith("MemTotal:"):
+                    memory_gb = int(line.split()[1]) // (1024 * 1024)
+                    break
+    except Exception:
+        pass
+
+    system_name = args.system_name or platform.node()
+    system_payload = {
+        "name":       system_name,
+        "cpu_model":  cpu_model,
+        "arch":       platform.machine(),
+        "memory_gb":  memory_gb,
+        "numa_nodes": topo.total_numa_nodes if topo else 1,
+    }
+
+    # Kernel version
+    kernel_version = args.kernel
+    if not kernel_version:
+        try:
+            kernel_version = subprocess.run(
+                ["uname", "-r"], capture_output=True, text=True, timeout=5
+            ).stdout.strip()
+        except Exception:
+            kernel_version = "unknown"
+
+    kernel_payload = {
+        "version":     kernel_version,
+        "config_name": args.kernel_config or "unknown",
+    }
+
+    snap = collect_system_snapshot(topo)
+
+    url = args.url.rstrip("/") + "/api/runs"
+    total_pushed = 0
+    total_groups = 0
+
+    for run_dir in run_dirs:
+        results_file = os.path.join(run_dir, "results.json")
+        if not os.path.isfile(results_file):
+            print(f"  Skipping {run_dir}: no results.json", file=sys.stderr)
+            continue
+
+        with open(results_file) as fh:
+            saved = json.load(fh)
+
+        run_items = saved.get("results", [])
+
+        # Group by (workload, config_name) — each group becomes one API push
+        groups: Dict = {}
+        for item in run_items:
+            key = (item.get("workload", "unknown"), item.get("config_name") or "")
+            groups.setdefault(key, []).append(item)
+
+        total_groups += len(groups)
+
+        for (workload, config_preset), items in groups.items():
+            result_entries = []
+            for item in items:
+                for metric, value in (item.get("metrics") or {}).items():
+                    try:
+                        result_entries.append({
+                            "metric_name": metric,
+                            "value":       float(value),
+                            "iteration":   item.get("iteration", 0),
+                        })
+                    except (TypeError, ValueError):
+                        pass
+
+            if not result_entries:
+                print(f"  - {workload}/{config_preset or 'default'}: no metrics, skipping")
+                total_groups -= 1
+                continue
+
+            payload = {
+                "system":          system_payload,
+                "kernel":          kernel_payload,
+                "workload":        workload,
+                "config_preset":   config_preset or None,
+                "workload_args":   items[0].get("workload_args", {}),
+                "ran_at":          items[0].get("timestamp") or saved.get("timestamp"),
+                "system_snapshot": snap,
+                "results":         result_entries,
+            }
+
+            data = json.dumps(payload, default=str).encode()
+            headers = {"Content-Type": "application/json"}
+            if args.api_key:
+                headers["Authorization"] = f"Bearer {args.api_key}"
+            req  = urllib.request.Request(
+                url, data=data,
+                headers=headers,
+                method="POST",
+            )
+            try:
+                with urllib.request.urlopen(req, timeout=30) as resp:
+                    body = json.loads(resp.read())
+                    print(
+                        f"  ✓ {workload}/{config_preset or 'default'}"
+                        f"  →  run_id={body['run_id']}"
+                    )
+                    total_pushed += 1
+            except urllib.error.HTTPError as exc:
+                detail = exc.read().decode(errors="replace")
+                print(f"  ✗ {workload}/{config_preset}: HTTP {exc.code} — {detail}", file=sys.stderr)
+            except Exception as exc:
+                print(f"  ✗ {workload}/{config_preset}: {exc}", file=sys.stderr)
+
+    print(f"\nPushed {total_pushed}/{total_groups} run group(s) to {args.url}")
+
+
+# ── System snapshot ────────────────────────────────────────────────────────
+
+def _read_sysfs(path: str, default: str = "n/a") -> str:
+    try:
+        return open(path).read().strip()
+    except OSError:
+        return default
+
+
+def _active_bracket(s: str) -> str:
+    """Extract the bracketed value from THP-style strings like 'always [madvise] never'."""
+    import re
+    m = re.search(r"\[(\w+)\]", s)
+    return m.group(1) if m else s
+
+
+def _cpu_model() -> str:
+    try:
+        for line in open("/proc/cpuinfo"):
+            if line.startswith("model name"):
+                return line.split(":", 1)[1].strip()
+    except OSError:
+        pass
+    try:
+        import subprocess
+        out = subprocess.run(["lscpu"], capture_output=True, text=True, timeout=5).stdout
+        for line in out.splitlines():
+            if line.startswith("Model name:"):
+                return line.split(":", 1)[1].strip()
+    except Exception:
+        pass
+    return "unknown"
+
+
+def _kernel_version() -> str:
+    try:
+        import subprocess
+        return subprocess.run(["uname", "-r"], capture_output=True, text=True, timeout=5).stdout.strip()
+    except Exception:
+        return "unknown"
+
+
+def _memory_gb() -> str:
+    try:
+        for line in open("/proc/meminfo"):
+            if line.startswith("MemTotal:"):
+                kb = int(line.split()[1])
+                return f"{kb / 1024 / 1024:.1f} GB"
+    except OSError:
+        pass
+    return "unknown"
+
+
+def _cpu_freq_governor() -> str:
+    gov = _read_sysfs("/sys/devices/system/cpu/cpu0/cpufreq/scaling_governor")
+    if gov == "n/a":
+        return "n/a (no cpufreq)"
+    # Check if all CPUs share the same governor
+    import glob
+    govs = set()
+    for p in glob.glob("/sys/devices/system/cpu/cpu*/cpufreq/scaling_governor"):
+        try:
+            govs.add(open(p).read().strip())
+        except OSError:
+            pass
+    if len(govs) > 1:
+        return f"{gov} (mixed: {', '.join(sorted(govs))})"
+    return gov
+
+
+
+def _irqbalance_active() -> str:
+    try:
+        import subprocess
+        r = subprocess.run(["pgrep", "-x", "irqbalance"], capture_output=True)
+        return "active" if r.returncode == 0 else "inactive"
+    except Exception:
+        return "unknown"
+
+
+def _khz_to_ghz(khz_str: str) -> str:
+    if khz_str.isdigit():
+        return f"{int(khz_str) / 1_000_000:.2f} GHz"
+    return "n/a"
+
+
+def _io_schedulers() -> dict:
+    """Return {device: active_scheduler} for all non-virtual block devices."""
+    import glob, re
+    result = {}
+    for path in sorted(glob.glob("/sys/block/*/queue/scheduler")):
+        dev = path.split("/")[3]
+        if re.match(r"(loop|ram|zram)\d*$", dev):
+            continue
+        raw = _read_sysfs(path)
+        result[dev] = _active_bracket(raw) if "[" in raw else raw
+    return result
+
+
+def _c_states() -> str:
+    """Summarise enabled/disabled C-states for cpu0."""
+    import glob, os
+    base = "/sys/devices/system/cpu/cpu0/cpuidle"
+    if not os.path.isdir(base):
+        return "n/a"
+    states = []
+    for state_dir in sorted(glob.glob(f"{base}/state*")):
+        name     = _read_sysfs(f"{state_dir}/name", os.path.basename(state_dir))
+        disabled = _read_sysfs(f"{state_dir}/disabled", "?")
+        latency  = _read_sysfs(f"{state_dir}/latency", "?")
+        flag = "off" if disabled == "1" else "on"
+        states.append(f"{name}({flag},{latency}us)")
+    return "  ".join(states) if states else "n/a"
+
+
+def _preempt_model() -> str:
+    """Detect kernel preemption model from /boot/config-* or /proc/config.gz."""
+    import gzip
+    kver = _kernel_version()
+    sources = [f"/boot/config-{kver}", "/proc/config.gz"]
+    lines = []
+    for src in sources:
+        try:
+            if src.endswith(".gz"):
+                with gzip.open(src) as f:
+                    lines = f.read().decode(errors="replace").splitlines()
+            else:
+                with open(src) as f:
+                    lines = f.readlines()
+            break
+        except OSError:
+            continue
+    if not lines:
+        return "unknown (no kernel config)"
+    cfg = {}
+    for l in lines:
+        l = l.strip()
+        if "=" in l and not l.startswith("##"):
+            k, _, v = l.lstrip("# ").partition("=")
+            cfg[k.strip()] = v.strip()
+    if cfg.get("CONFIG_PREEMPT_RT") == "y":
+        return "PREEMPT_RT (fully preemptible RT)"
+    if cfg.get("CONFIG_PREEMPT") == "y":
+        return "PREEMPT (full preemption)"
+    if cfg.get("CONFIG_PREEMPT_DYNAMIC") == "y":
+        rt = _read_sysfs("/sys/kernel/debug/sched/preempt", "")
+        return f"PREEMPT_DYNAMIC (runtime: {rt})" if rt else "PREEMPT_DYNAMIC"
+    if cfg.get("CONFIG_PREEMPT_VOLUNTARY") == "y":
+        return "PREEMPT_VOLUNTARY"
+    if cfg.get("CONFIG_PREEMPT_NONE") == "y":
+        return "PREEMPT_NONE (server)"
+    return "unknown"
+
+
+def _mitigations() -> dict:
+    """Read /sys/devices/system/cpu/vulnerabilities/*."""
+    import glob
+    result = {}
+    for path in sorted(glob.glob("/sys/devices/system/cpu/vulnerabilities/*")):
+        name = path.rsplit("/", 1)[1].replace("_", " ")
+        result[name] = _read_sysfs(path)
+    return result
+
+
+def collect_system_snapshot(topo) -> dict:
+    """Gather system details and kernel knob values."""
+    import platform
+
+    smt_width  = topo.threads_per_core() if topo else 1
+    smt_status = "enabled" if smt_width > 1 else "disabled"
+
+    # ── CPU frequency ────────────────────────────────────────────
+    min_f = _read_sysfs("/sys/devices/system/cpu/cpu0/cpufreq/scaling_min_freq")
+    max_f = _read_sysfs("/sys/devices/system/cpu/cpu0/cpufreq/scaling_max_freq")
+    freq_range = (
+        f"{_khz_to_ghz(min_f)} - {_khz_to_ghz(max_f)}"
+        if min_f.isdigit() and max_f.isdigit() else "n/a"
+    )
+    epp = _read_sysfs(
+        "/sys/devices/system/cpu/cpu0/cpufreq/energy_performance_preference"
+    )
+    boost_raw = _read_sysfs("/sys/devices/system/cpu/cpufreq/boost")
+    boost = {"0": "disabled", "1": "enabled"}.get(boost_raw, boost_raw)
+    pstate_driver = _read_sysfs("/sys/devices/system/cpu/cpu0/cpufreq/scaling_driver")
+    pstate_status = _read_sysfs(
+        "/sys/devices/system/cpu/amd_pstate/status",
+        _read_sysfs("/sys/devices/system/cpu/intel_pstate/status")
+    )
+
+    # ── Scheduler ────────────────────────────────────────────────
+    def _sched(name):
+        return _read_sysfs(f"/proc/sys/kernel/{name}")
+
+    autogroup = {"0": "off", "1": "on"}.get(_sched("sched_autogroup_enabled"), "n/a")
+    energy_aware_raw = _sched("sched_energy_aware")
+    energy_aware = {"0": "off", "1": "on", "": "n/a", "n/a": "n/a"}.get(
+        energy_aware_raw, energy_aware_raw
+    )
+    timer_migration = {"0": "off", "1": "on"}.get(
+        _read_sysfs("/proc/sys/kernel/timer_migration"), "n/a"
+    )
+    numa_balancing = {"0": "off", "1": "on"}.get(_sched("numa_balancing"), "n/a")
+
+    # ── THP ──────────────────────────────────────────────────────
+    thp_base    = "/sys/kernel/mm/transparent_hugepage"
+    thp_enabled = _active_bracket(_read_sysfs(f"{thp_base}/enabled"))
+    thp_defrag  = _active_bracket(_read_sysfs(f"{thp_base}/defrag"))
+    thp_khpd    = _read_sysfs(f"{thp_base}/khugepaged/defrag")
+
+    # ── Hugepages ─────────────────────────────────────────────────
+    hp2m = _read_sysfs("/proc/sys/vm/nr_hugepages")
+    hp1g = _read_sysfs("/sys/kernel/mm/hugepages/hugepages-1048576kB/nr_hugepages", "0")
+    hugepages = f"2 MB x {hp2m}" + (f",  1 GB x {hp1g}" if hp1g != "0" else "")
+
+    # ── VM / memory ───────────────────────────────────────────────
+    overcommit_raw = _read_sysfs("/proc/sys/vm/overcommit_memory")
+    overcommit = {"0": "heuristic", "1": "always", "2": "never"}.get(
+        overcommit_raw, overcommit_raw
+    )
+    zone_reclaim_raw = _read_sysfs("/proc/sys/vm/zone_reclaim_mode")
+    zone_reclaim = {
+        "0": "off", "1": "reclaim",
+        "2": "reclaim+write", "4": "reclaim+swap",
+    }.get(zone_reclaim_raw, zone_reclaim_raw)
+    aslr_raw = _read_sysfs("/proc/sys/kernel/randomize_va_space")
+    aslr = {"0": "off", "1": "conservative", "2": "full"}.get(aslr_raw, aslr_raw)
+
+    # ── CPU isolation / tickless ──────────────────────────────────
+    def _cpulist(path):
+        v = _read_sysfs(path, "").strip().replace("(null)", "").strip()
+        return v or "none"
+
+    isolated  = _cpulist("/sys/devices/system/cpu/isolated")
+    nohz_full = _cpulist("/sys/devices/system/cpu/nohz_full")
+    rcu_nocbs = _cpulist("/sys/devices/system/cpu/rcu_nocbs")
+
+    # ── Kernel / boot ─────────────────────────────────────────────
+    rcu_expedited = {"0": "off", "1": "on"}.get(
+        _read_sysfs("/sys/kernel/rcu_expedited"), "n/a"
+    )
+    rcu_normal = {"0": "off", "1": "on"}.get(
+        _read_sysfs("/sys/kernel/rcu_normal"), "n/a"
+    )
+    nmi_watchdog = {"0": "off", "1": "on"}.get(
+        _read_sysfs("/proc/sys/kernel/nmi_watchdog"), "n/a"
+    )
+
+    return {
+        "system": {
+            "hostname":       platform.node(),
+            "kernel":         _kernel_version(),
+            "cpu_model":      _cpu_model(),
+            "sockets":        topo.total_sockets if topo else "?",
+            "physical_cores": topo.total_physical_cores if topo else "?",
+            "logical_cpus":   topo.total_logical_cpus if topo else "?",
+            "smt":            f"{smt_status} ({smt_width}x per core)",
+            "numa_nodes":     topo.total_numa_nodes if topo else "?",
+            "memory":         _memory_gb(),
+        },
+        "cpu_power": {
+            "pstate driver":   pstate_driver,
+            "pstate mode":     pstate_status,
+            "governor":        _cpu_freq_governor(),
+            "boost (turbo)":   boost,
+            "EPP":             epp,
+            "freq range":      freq_range,
+            "freq now (cpu0)": _khz_to_ghz(
+                _read_sysfs("/sys/devices/system/cpu/cpu0/cpufreq/scaling_cur_freq")
+            ),
+            "SMT control":     _read_sysfs("/sys/devices/system/cpu/smt/control"),
+            "C-states (cpu0)": _c_states(),
+        },
+        "scheduler": {
+            "preempt model":     _preempt_model(),
+            "autogroup":         autogroup,
+            "energy aware":      energy_aware,
+            "timer migration":   timer_migration,
+            "NUMA balancing":    numa_balancing,
+            "RT period (us)":    _sched("sched_rt_period_us"),
+            "RT runtime (us)":   _sched("sched_rt_runtime_us"),
+            "RR timeslice (ms)": _sched("sched_rr_timeslice_ms"),
+            "util clamp min":    _sched("sched_util_clamp_min"),
+            "util clamp max":    _sched("sched_util_clamp_max"),
+        },
+        "memory_vm": {
+            "THP":                      thp_enabled,
+            "THP defrag":               thp_defrag,
+            "khugepaged defrag":        thp_khpd,
+            "hugepages":                hugepages,
+            "overcommit":               overcommit,
+            "zone reclaim":             zone_reclaim,
+            "swappiness":               _read_sysfs("/proc/sys/vm/swappiness"),
+            "dirty_ratio":              _read_sysfs("/proc/sys/vm/dirty_ratio") + " %",
+            "dirty_background_ratio":   _read_sysfs("/proc/sys/vm/dirty_background_ratio") + " %",
+            "dirty_writeback (cs)":     _read_sysfs("/proc/sys/vm/dirty_writeback_centisecs"),
+            "dirty_expire (cs)":        _read_sysfs("/proc/sys/vm/dirty_expire_centisecs"),
+            "compaction_proactiveness": _read_sysfs("/proc/sys/vm/compaction_proactiveness"),
+            "watermark_scale_factor":   _read_sysfs("/proc/sys/vm/watermark_scale_factor"),
+            "nr_overcommit_hugepages":  _read_sysfs("/proc/sys/vm/nr_overcommit_hugepages"),
+            "ASLR":                     aslr,
+        },
+        "isolation": {
+            "isolated CPUs": isolated,
+            "nohz_full":     nohz_full,
+            "rcu_nocbs":     rcu_nocbs,
+            "IRQ balance":   _irqbalance_active(),
+            "IRQ affinity":  _read_sysfs("/proc/irq/default_smp_affinity"),
+        },
+        "kernel_boot": {
+            "preempt model":   _preempt_model(),
+            "RCU expedited":   rcu_expedited,
+            "RCU normal":      rcu_normal,
+            "NMI watchdog":    nmi_watchdog,
+            "watchdog thresh": _read_sysfs("/proc/sys/kernel/watchdog_thresh") + " s",
+            "cmdline":         _read_sysfs("/proc/cmdline"),
+        },
+        "network": {
+            "TCP congestion":     _read_sysfs("/proc/sys/net/ipv4/tcp_congestion_control"),
+            "rmem_max":           _read_sysfs("/proc/sys/net/core/rmem_max"),
+            "wmem_max":           _read_sysfs("/proc/sys/net/core/wmem_max"),
+            "netdev_max_backlog": _read_sysfs("/proc/sys/net/core/netdev_max_backlog"),
+            "tcp_timestamps":     _read_sysfs("/proc/sys/net/ipv4/tcp_timestamps"),
+            "tcp_sack":           _read_sysfs("/proc/sys/net/ipv4/tcp_sack"),
+        },
+        "io_schedulers": _io_schedulers(),
+        "mitigations":   _mitigations(),
+    }
+
+
+def _print_kv_section(title: str, kvs: dict) -> None:
+    if not kvs:
+        return
+    print(title)
+    key_w = max(len(k) for k in kvs) + 2
+    for k, v in kvs.items():
+        print(f"  {k:<{key_w}}: {v}")
+    print()
+
+
+def _print_system_snapshot(snap: dict) -> None:
+    sys_info = snap["system"]
+
+    print("System")
+    print(f"  Host          : {sys_info['hostname']}")
+    print(f"  Kernel        : {sys_info['kernel']}")
+    print(f"  CPU           : {sys_info['cpu_model']}")
+    print(
+        f"  Topology      : {sys_info['sockets']} socket(s), "
+        f"{sys_info['physical_cores']} physical cores, "
+        f"{sys_info['logical_cpus']} logical CPUs, "
+        f"{sys_info['numa_nodes']} NUMA node(s)"
+    )
+    print(f"  SMT           : {sys_info['smt']}")
+    print(f"  Memory        : {sys_info['memory']}")
+    print()
+
+    _print_kv_section("CPU power & frequency", snap["cpu_power"])
+    _print_kv_section("Scheduler", snap["scheduler"])
+    _print_kv_section("Memory / VM", snap["memory_vm"])
+    _print_kv_section("CPU isolation & tickless", snap["isolation"])
+
+    io = snap.get("io_schedulers", {})
+    if io:
+        print("I/O schedulers")
+        for dev, sched in io.items():
+            print(f"  {dev:<16}: {sched}")
+        print()
+
+    _print_kv_section("Network", snap["network"])
+    _print_kv_section("Kernel / boot", snap["kernel_boot"])
+
+    mit = snap.get("mitigations", {})
+    if mit:
+        active = {k: v for k, v in mit.items() if not v.lower().startswith("not affected")}
+        not_affected = [k for k, v in mit.items() if v.lower().startswith("not affected")]
+        print("Security mitigations")
+        if active:
+            key_w = max(len(k) for k in active) + 2
+            for k, v in active.items():
+                print(f"  {k:<{key_w}}: {v}")
+        if not_affected:
+            print(f"  Not affected   : {', '.join(not_affected)}")
+        print()
+
+
 # ── Table printing helpers ──────────────────────────────────────────────────
 
 def _print_simple_table(headers: List[str], rows: List[List[str]]) -> None:
@@ -970,6 +1513,41 @@ def build_parser() -> argparse.ArgumentParser:
         help="List cloud VMs tracked by this toolkit",
     )
 
+    # push  — send results to a Garuda portal instance
+    p_push = subparsers.add_parser(
+        "push",
+        help="Push saved benchmark results to a Garuda portal instance",
+        description=(
+            "Reads a results.json file and uploads each (workload, config) group "
+            "to the portal's /api/runs endpoint.  System info is auto-detected; "
+            "kernel version is read from 'uname -r' unless --kernel is given."
+        ),
+    )
+    p_push.add_argument(
+        "--url", required=True, metavar="URL",
+        help="Base URL of the portal (e.g. http://perf.example.com)",
+    )
+    p_push.add_argument(
+        "--run-id", metavar="RUN_ID",
+        help="Specific run ID to push (default: most recent run in results/)",
+    )
+    p_push.add_argument(
+        "--system-name", metavar="NAME",
+        help="Override the system name (default: hostname)",
+    )
+    p_push.add_argument(
+        "--kernel", metavar="VERSION",
+        help="Kernel version string (default: output of 'uname -r')",
+    )
+    p_push.add_argument(
+        "--kernel-config", metavar="NAME", default="unknown",
+        help="Kernel config label, e.g. 'defconfig' or 'distro-ubuntu' (default: unknown)",
+    )
+    p_push.add_argument(
+        "--api-key", metavar="KEY", default=os.environ.get("GARUDA_API_KEY", ""),
+        help="Push API key for the portal (default: $GARUDA_API_KEY env var)",
+    )
+
     return parser
 
 
@@ -1021,7 +1599,8 @@ def main():
         "cloud-provision": cmd_cloud_provision,
         "cloud-exec": cmd_cloud_exec,
         "cloud-destroy": cmd_cloud_destroy,
-        "cloud-list": cmd_cloud_list,
+        "cloud-list":    cmd_cloud_list,
+        "push":          cmd_push,
     }
 
     handler = dispatch.get(args.command)
