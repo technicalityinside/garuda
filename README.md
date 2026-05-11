@@ -113,7 +113,12 @@ python3 main.py scaling --workload python_bench --mode powers_of_2
 # 6. Compare SMT vs physical cores
 python3 main.py scaling --workload python_bench --configs 1c1t,1c2t,2c2t,2c4t
 
-# 7. List and inspect saved results
+# 7. Run multiple workloads across multiple configs in one shot
+python3 main.py multi-run \
+  --workloads stream,sysbench_cpu,python_bench \
+  --configs single_core,full_socket --iterations 3
+
+# 8. List and inspect saved results
 python3 main.py report --list
 python3 main.py report --run-id <run_id>
 ```
@@ -413,6 +418,95 @@ Config | Threads | ops_per_sec | Speedup | Efficiency
 ```
 
 Speedup and efficiency are always relative to the first config in the list (or thread count = 1 for thread sweeps).
+
+---
+
+### `multi-run`
+
+Run multiple workloads across multiple configurations as a full matrix — every (workload, config) pair — and print a result table when done.
+
+```bash
+python3 main.py multi-run --workloads NAME,NAME,... \
+                          [--configs PRESET,... | --threads N,N,...] \
+                          [--iterations N] [--dry-run] [--verbose] [--stop-on-error] \
+                          [--arg key=value ...] \
+                          [--push-url URL] [--api-key KEY] [--kernel VERSION] [--kernel-config LABEL]
+```
+
+| Flag | Default | Description |
+|---|---|---|
+| `--workloads NAME,...` | (required) | Comma-separated workload names |
+| `--configs PRESET,...` | `single_core` | Named config presets to sweep (see `list-configs`) |
+| `--threads N,N,...` | — | Explicit thread counts instead of named presets |
+| `--iterations N` | `1` | Iterations per (workload, config) combination |
+| `--dry-run` | off | Print commands without executing |
+| `--verbose` | off | Print per-iteration metrics as they complete |
+| `--stop-on-error` | off | Abort the matrix after the first failed combination |
+| `--arg key=value` | — | Workload-specific arguments applied to every run |
+| `--push-url URL` | — | Push all successful runs to this Kernel Ledger URL after the matrix completes |
+| `--api-key KEY` | `$GARUDA_API_KEY` | Ledger push API key |
+| `--kernel VERSION` | `uname -r` | Kernel version string to tag pushed results with |
+| `--kernel-config LABEL` | `unknown` | Kernel config label stored in the ledger |
+
+**Examples:**
+
+```bash
+# 3 workloads × 2 configs = 6 runs, 3 iterations each
+python3 main.py multi-run \
+  --workloads stream,sysbench_cpu,python_bench \
+  --configs single_core,full_socket \
+  --iterations 3
+
+# Custom thread counts instead of named presets
+python3 main.py multi-run \
+  --workloads hackbench,schbench \
+  --threads 1,4,8,16 --iterations 5
+
+# Single workload against several configs with a shared argument
+python3 main.py multi-run --workloads fio \
+  --configs 1c1t,2c2t,4c4t,8c8t --arg rw=randread bs=4k
+
+# Dry run — preview every command that would be executed
+python3 main.py multi-run \
+  --workloads stream,fio --configs single_core,full_socket --dry-run
+
+# Run matrix then push all successful results to Kernel Ledger
+python3 main.py multi-run \
+  --workloads stream,sysbench_cpu,hackbench \
+  --configs single_core,full_socket --iterations 3 \
+  --push-url http://perf.example.com --api-key my-key
+```
+
+**Output format:**
+
+```
+Multi-run: 3 workload(s) × 2 config(s) = 6 run(s)
+  Workloads : stream, sysbench_cpu, python_bench
+  Configs   : single_core, full_socket
+  Iterations: 3
+
+[1/6] stream / single_core  (1 thread(s), 3 iter)
+  iter=0 [OK] wall=5.12s  triad_mb_s=28432
+  ...
+
+────────────────────────────────────────────────────────────────
+Multi-run complete: 6/6 combination(s) succeeded
+────────────────────────────────────────────────────────────────
+
+Primary metric (mean) per cell:
+Workload              single_core    full_socket
+──────────────────────────────────────────────
+stream                      28432          91847
+sysbench_cpu                 2341           7203
+python_bench                  299            968
+
+Run IDs:
+  stream/single_core          3/3       20260511_101523_stream_single_core
+  stream/full_socket          3/3       20260511_101528_stream_full_socket
+  ...
+```
+
+`--configs` and `--threads` are mutually exclusive. If neither is given, `single_core` is used. `--threads` automatically selects physical cores first (no SMT).
 
 ---
 
