@@ -16,7 +16,8 @@ class KernelEntry:
     def __init__(self, version: str, status: str = "pending",
                  run_ids: List[str] = None, scores: Dict[str, float] = None,
                  error: Optional[str] = None, started_at: Optional[str] = None,
-                 completed_at: Optional[str] = None):
+                 completed_at: Optional[str] = None,
+                 source_spec: Optional[dict] = None):
         self.version = version
         self.status = status
         self.run_ids = run_ids or []
@@ -24,6 +25,7 @@ class KernelEntry:
         self.error = error
         self.started_at = started_at
         self.completed_at = completed_at
+        self.source_spec = source_spec or {"type": "apt"}
 
     def to_dict(self) -> dict:
         return {
@@ -34,6 +36,7 @@ class KernelEntry:
             "error": self.error,
             "started_at": self.started_at,
             "completed_at": self.completed_at,
+            "source_spec": self.source_spec,
         }
 
     @classmethod

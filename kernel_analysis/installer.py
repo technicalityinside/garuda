@@ -1,9 +1,16 @@
 """Kernel installation, GRUB manipulation, and reboot helpers."""
 
+import glob
+import gzip
 import os
 import re
+import shutil
 import subprocess
-from typing import Optional, Tuple
+import tarfile
+import urllib.request
+from typing import List, Optional, Tuple
+
+_DEFAULT_BUILD_BASE = "/var/cache/garuda/kernel-builds"
 
 # ── Current kernel ────────────────────────────────────────────────────────────
 
@@ -50,6 +57,236 @@ def install(kernel_ver: str) -> Tuple[bool, str]:
         return True, f"Installed {image_pkg} (headers unavailable)"
 
     return False, f"apt-get install {image_pkg} failed (exit {r.returncode})"
+
+
+def parse_kernel_specs(specs_str: str) -> List[dict]:
+    """
+    Parse a comma-separated string of kernel specs into a list of dicts.
+
+    Formats:
+      6.8.0-55-generic                        — apt install (plain version)
+      apt:6.8.0-55-generic                    — apt install (explicit)
+      github:owner/repo:branch[@label]        — build from GitHub clone
+      github:https://github.com/o/r:branch[@label]
+      tarball:https://example.com/k.tar.gz[@label]  — build from tarball URL
+
+    Each entry returned:  {"version": str, "source_spec": dict}
+    """
+    results = []
+    for raw in specs_str.split(","):
+        raw = raw.strip()
+        if not raw:
+            continue
+
+        if raw.startswith("github:"):
+            rest = raw[len("github:"):]
+            label = None
+            if "@" in rest:
+                rest, label = rest.rsplit("@", 1)
+                label = label.strip()
+            colon_idx = rest.rfind(":")
+            if colon_idx == -1:
+                raise ValueError(
+                    f"github: spec missing branch — use github:owner/repo:branch: {raw!r}"
+                )
+            repo_part = rest[:colon_idx].strip()
+            branch = rest[colon_idx + 1:].strip()
+            if not repo_part.startswith("http"):
+                repo_part = f"https://github.com/{repo_part}"
+            version = label or f"{repo_part.rstrip('/').split('/')[-1]}-{branch}"
+            results.append({
+                "version": version,
+                "source_spec": {"type": "github", "repo": repo_part,
+                                "branch": branch, "label": label},
+            })
+
+        elif raw.startswith("tarball:"):
+            rest = raw[len("tarball:"):]
+            label = None
+            if "@" in rest:
+                rest, label = rest.rsplit("@", 1)
+                label = label.strip()
+            url = rest.strip()
+            if not label:
+                basename = url.rstrip("/").split("/")[-1]
+                for ext in (".tar.gz", ".tar.bz2", ".tar.xz", ".tgz"):
+                    if basename.endswith(ext):
+                        basename = basename[: -len(ext)]
+                        break
+                label = basename
+            results.append({
+                "version": label,
+                "source_spec": {"type": "tarball", "url": url, "label": label},
+            })
+
+        elif raw.startswith("apt:"):
+            ver = raw[len("apt:"):].strip()
+            results.append({"version": ver, "source_spec": {"type": "apt"}})
+
+        else:
+            results.append({"version": raw, "source_spec": {"type": "apt"}})
+
+    return results
+
+
+def _configure_kernel(src_dir: str) -> Tuple[bool, str]:
+    """Copy the running kernel's .config into src_dir and run make olddefconfig."""
+    running = current_kernel()
+    config_src = f"/boot/config-{running}"
+
+    dest = os.path.join(src_dir, ".config")
+    if os.path.exists(config_src):
+        shutil.copy(config_src, dest)
+    elif os.path.exists("/proc/config.gz"):
+        with gzip.open("/proc/config.gz", "rb") as gz_f, open(dest, "wb") as out_f:
+            out_f.write(gz_f.read())
+    else:
+        return False, f"No kernel config found at {config_src} or /proc/config.gz"
+
+    r = subprocess.run(["make", "olddefconfig"], cwd=src_dir, timeout=300)
+    if r.returncode != 0:
+        return False, "make olddefconfig failed"
+    return True, "Kernel config prepared"
+
+
+def _build_and_install(src_dir: str) -> Tuple[bool, str, str]:
+    """
+    Build kernel .deb packages via make bindeb-pkg and install them.
+    Returns (ok, message, kernel_release_string).
+    """
+    nproc = os.cpu_count() or 1
+    print(f"    make -j{nproc} bindeb-pkg  (this may take 30–90 min) ...")
+    r = subprocess.run(
+        ["make", f"-j{nproc}", "bindeb-pkg", "LOCALVERSION="],
+        cwd=src_dir,
+        timeout=7200,
+    )
+    if r.returncode != 0:
+        return False, "make bindeb-pkg failed", ""
+
+    # .deb files land in the parent of the source tree
+    parent = os.path.dirname(src_dir)
+    debs = sorted(glob.glob(os.path.join(parent, "linux-image-*.deb")))
+    if not debs:
+        debs = sorted(glob.glob(os.path.join(src_dir, "linux-image-*.deb")))
+    if not debs:
+        return False, "No linux-image-*.deb found after build", ""
+
+    # Derive actual kernel release version
+    kernel_release = ""
+    kr_file = os.path.join(src_dir, "include/config/kernel.release")
+    if os.path.exists(kr_file):
+        kernel_release = open(kr_file).read().strip()
+    if not kernel_release:
+        m = re.search(r"linux-image-([^_]+)_", os.path.basename(debs[0]))
+        if m:
+            kernel_release = m.group(1)
+
+    print(f"    dpkg -i {len(debs)} package(s) ...")
+    r = subprocess.run(["dpkg", "-i"] + debs, timeout=300)
+    if r.returncode != 0:
+        return False, f"dpkg -i failed (exit {r.returncode})", ""
+
+    return True, f"Installed kernel {kernel_release}", kernel_release
+
+
+def install_from_github(source_spec: dict,
+                        build_base: str = _DEFAULT_BUILD_BASE) -> Tuple[bool, str, str]:
+    """Clone a GitHub repo at a branch and build+install the kernel."""
+    repo = source_spec["repo"]
+    branch = source_spec["branch"]
+    label = source_spec.get("label") or branch
+
+    clone_dir = os.path.join(build_base, f"linux-github-{re.sub(r'[^A-Za-z0-9._-]', '_', label)}")
+    os.makedirs(build_base, exist_ok=True)
+
+    if os.path.isdir(clone_dir):
+        print(f"    Reusing existing clone at {clone_dir}")
+    else:
+        print(f"    git clone --depth=1 -b {branch} {repo} ...")
+        r = subprocess.run(
+            ["git", "clone", "--depth=1", "-b", branch, repo, clone_dir],
+            timeout=1800,
+        )
+        if r.returncode != 0:
+            return False, f"git clone failed for {repo}@{branch}", ""
+
+    ok, msg = _configure_kernel(clone_dir)
+    if not ok:
+        return False, msg, ""
+    return _build_and_install(clone_dir)
+
+
+def install_from_tarball(source_spec: dict,
+                         build_base: str = _DEFAULT_BUILD_BASE) -> Tuple[bool, str, str]:
+    """Download a kernel tarball, extract it, and build+install."""
+    url = source_spec["url"]
+    label = source_spec.get("label") or "kernel"
+
+    os.makedirs(build_base, exist_ok=True)
+    basename = url.rstrip("/").split("/")[-1]
+    local_tar = os.path.join(build_base, basename)
+    src_dir = os.path.join(
+        build_base, f"linux-tarball-{re.sub(r'[^A-Za-z0-9._-]', '_', label)}"
+    )
+
+    if not os.path.exists(local_tar):
+        print(f"    Downloading {url} ...")
+        try:
+            urllib.request.urlretrieve(url, local_tar)
+        except Exception as e:
+            return False, f"Download failed: {e}", ""
+    else:
+        print(f"    Using cached tarball {local_tar}")
+
+    if os.path.isdir(src_dir):
+        print(f"    Reusing existing source at {src_dir}")
+    else:
+        print(f"    Extracting {basename} ...")
+        try:
+            with tarfile.open(local_tar) as tf:
+                # Find the single top-level directory in the archive
+                top_dirs = {m.name.split("/")[0] for m in tf.getmembers()
+                            if "/" in m.name}
+                tf.extractall(build_base)
+            if top_dirs:
+                extracted = os.path.join(build_base, sorted(top_dirs)[0])
+                os.rename(extracted, src_dir)
+        except Exception as e:
+            return False, f"Extraction failed: {e}", ""
+
+    ok, msg = _configure_kernel(src_dir)
+    if not ok:
+        return False, msg, ""
+    return _build_and_install(src_dir)
+
+
+def install_kernel(entry,
+                   build_base: str = _DEFAULT_BUILD_BASE) -> Tuple[bool, str, str]:
+    """
+    Install a kernel based on entry.source_spec.
+    Returns (ok, message, actual_kernel_version_string).
+
+    For apt builds the actual version equals entry.version.
+    For github/tarball the actual version is the built kernelrelease string.
+    """
+    source_spec = getattr(entry, "source_spec", None) or {"type": "apt"}
+    spec_type = source_spec.get("type", "apt")
+
+    if spec_type == "apt":
+        if is_installed(entry.version):
+            return True, f"Already installed: {entry.version}", entry.version
+        ok, msg = install(entry.version)
+        return ok, msg, entry.version if ok else ""
+
+    elif spec_type == "github":
+        return install_from_github(source_spec, build_base)
+
+    elif spec_type == "tarball":
+        return install_from_tarball(source_spec, build_base)
+
+    else:
+        return False, f"Unknown source type: {spec_type!r}", ""
 
 
 def list_available_kernels(pattern: str = "linux-image-") -> list:

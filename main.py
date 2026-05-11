@@ -1557,8 +1557,8 @@ def cmd_kernel_analyze(args, topo):
 
     from kernel_analysis.state import AnalysisSession, KernelEntry, DEFAULT_STATE_FILE
     from kernel_analysis.installer import (
-        current_kernel, is_installed, install, set_next_boot, do_reboot,
-        list_available_kernels,
+        current_kernel, is_installed, install, install_kernel,
+        parse_kernel_specs, set_next_boot, do_reboot, list_available_kernels,
     )
     from kernel_analysis.service import install_service, remove_service, service_status
     from kernel_analysis.scorer import compute_scores, print_score_report
@@ -1635,8 +1635,13 @@ def cmd_kernel_analyze(args, topo):
             print("Error: --kernels is required.", file=sys.stderr)
             sys.exit(1)
 
-        kernel_list = [k.strip() for k in args.kernels.split(",") if k.strip()]
-        if not kernel_list:
+        try:
+            kernel_specs = parse_kernel_specs(args.kernels)
+        except ValueError as e:
+            print(f"Error: {e}", file=sys.stderr)
+            sys.exit(1)
+
+        if not kernel_specs:
             print("Error: --kernels produced an empty list.", file=sys.stderr)
             sys.exit(1)
 
@@ -1652,7 +1657,10 @@ def cmd_kernel_analyze(args, topo):
         ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S")
         session = AnalysisSession(
             session_id=f"kernel_analysis_{ts}",
-            kernels=[KernelEntry(version=k) for k in kernel_list],
+            kernels=[
+                KernelEntry(version=s["version"], source_spec=s["source_spec"])
+                for s in kernel_specs
+            ],
             workloads=workload_list,
             config=getattr(args, "config", None),
             iterations=getattr(args, "iterations", 3),
@@ -1665,7 +1673,10 @@ def cmd_kernel_analyze(args, topo):
         )
 
         print(f"\n[kernel-analyze] Session: {session.session_id}")
-        print(f"  Kernels   : {', '.join(kernel_list)}")
+        for k in session.kernels:
+            src_type = k.source_spec.get("type", "apt")
+            tag = "" if src_type == "apt" else f"  [{src_type}]"
+            print(f"  Kernel    : {k.version}{tag}")
         print(f"  Workloads : {', '.join(workload_list)}")
         print(f"  Config    : {session.config or 'single_core'}")
         print(f"  Iterations: {session.iterations}")
@@ -1677,9 +1688,13 @@ def cmd_kernel_analyze(args, topo):
         if getattr(args, "dry_run", False):
             print("[DRY RUN] Would install kernels, configure GRUB, and reboot.")
             print("Plan:")
-            for k in kernel_list:
-                flag = " [installed]" if is_installed(k) else " [needs install]"
-                print(f"  {k}{flag}")
+            for k in session.kernels:
+                src_type = k.source_spec.get("type", "apt")
+                if src_type == "apt":
+                    flag = " [installed]" if is_installed(k.version) else " [needs install]"
+                else:
+                    flag = f" [source build via {src_type}]"
+                print(f"  {k.version}{flag}")
             return
 
         session.started_at = datetime.datetime.now().isoformat()
@@ -1709,7 +1724,7 @@ def _ka_loop(session, topo) -> None:
     import datetime
 
     from kernel_analysis.installer import (
-        current_kernel, is_installed, install, set_next_boot, do_reboot,
+        current_kernel, is_installed, install_kernel, set_next_boot, do_reboot,
     )
     from kernel_analysis.service import remove_service
     from kernel_analysis.scorer import compute_scores, print_score_report
@@ -1771,19 +1786,22 @@ def _ka_loop(session, topo) -> None:
 
     print(f"\n[kernel-analyze] Next kernel: {next_entry.version}")
 
-    # Install if needed
-    if not is_installed(next_entry.version):
-        print(f"  Installing {next_entry.version} ...")
-        ok, msg = install(next_entry.version)
-        if not ok:
-            print(f"  [ERROR] {msg}")
-            next_entry.status = "failed"
-            next_entry.error = msg
-            session.save()
-            # Skip to the next one
-            _ka_loop(session, topo)
-            return
-        print(f"  {msg}")
+    # Install (apt checks is_installed internally; github/tarball reuses build dirs)
+    print(f"  Installing {next_entry.version} ...")
+    ok, msg, actual_ver = install_kernel(next_entry)
+    if not ok:
+        print(f"  [ERROR] {msg}")
+        next_entry.status = "failed"
+        next_entry.error = msg
+        session.save()
+        _ka_loop(session, topo)
+        return
+    print(f"  {msg}")
+
+    # For source builds the built version string may differ from the label
+    if actual_ver and actual_ver != next_entry.version:
+        next_entry.version = actual_ver
+        session.save()
 
     next_entry.status = "installed"
     session.save()
