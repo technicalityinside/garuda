@@ -81,8 +81,11 @@ class MemAlloc(BaseWorkload):
         Legacy (< 0.13):
           stress-ng: metrc: [PID] malloc   820587.41 bogo ops/s (real time)
 
-        Table (>= 0.13):
+        Pipe table (0.13 – 0.16):
           stress-ng: metrc: [PID] malloc | 24617628 | 30.00s | ... | 820587.41 | ...
+
+        Space table (>= 0.17):
+          stress-ng: metrc: [PID] malloc   22457561  5.02  4.89  0.13  4474444.62  4478192.26
         """
         stressor = self._current_stressor
         combined = stdout + "\n" + stderr
@@ -101,7 +104,7 @@ class MemAlloc(BaseWorkload):
                 metrics[f"{stressor}_bogo_ops_per_sec"] = float(m.group(1))
                 return metrics
 
-            # Table format: extract the 5th numeric column (ops/s real time)
+            # Pipe-table format (0.13–0.16)
             if "|" in line:
                 parts = [p.strip() for p in line.split("|")]
                 nums: List[float] = []
@@ -110,9 +113,18 @@ class MemAlloc(BaseWorkload):
                         nums.append(float(p.rstrip("s")))
                     except ValueError:
                         pass
-                # Columns: bogo_ops | real_s | usr_s | sys_s | ops_s_real | ops_s_usr_sys
                 if len(nums) >= 5:
                     metrics[f"{stressor}_bogo_ops_per_sec"] = nums[-2]
                     return metrics
+
+            # Space-table format (>= 0.17):
+            # "... [PID] STRESSOR  bogo_ops  real_s  usr_s  sys_s  ops_s_real  ops_s_usr_sys"
+            m2 = re.search(
+                r'\[\d+\]\s+\S+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+[\d.]+\s+([\d.]+(?:e[+-]?\d+)?)',
+                line,
+            )
+            if m2:
+                metrics[f"{stressor}_bogo_ops_per_sec"] = float(m2.group(1))
+                return metrics
 
         return metrics

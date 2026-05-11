@@ -130,31 +130,72 @@ class SockPerf(BaseWorkload):
 
     def parse_output(self, stdout: str, stderr: str, returncode: int) -> Dict[str, float]:
         """
-        Parse sockperf summary lines, e.g.:
+        Parse sockperf output. Handles two formats:
+
+        Old format:
           sockperf: Summary: Latency is 4.056 usec
           sockperf: Total 99.000 Percentile is 7.563 usec
-          sockperf: Total 99.900 Percentile is 12.456 usec
+
+        Current format (>= 3.x):
+          sockperf: Summary: Round trip is 4.625 usec
+          sockperf: ====> avg-rtt=4.625 (std-dev=1.566)
+          sockperf: ---> <MAX> observation = 2359.716
+          sockperf: ---> percentile 99.000 =    5.770
+          sockperf: ---> <MIN> observation =    3.877
         """
         metrics: Dict[str, float] = {}
-        combined = stdout + "\n" + stderr
+        # Strip ANSI escape codes before parsing
+        combined = re.sub(r'\x1b\[[0-9;]*m', '', stdout + "\n" + stderr)
 
         for line in combined.splitlines():
-            # Average latency
+            # ── Current format ────────────────────────────────────────────────
+            # "Summary: Round trip is X usec"
+            m = re.search(r'Summary:\s+Round trip is\s+([\d.]+)\s+usec', line)
+            if m:
+                metrics["latency_avg_us"] = float(m.group(1))
+                continue
+
+            # "====> avg-rtt=X (std-dev=Y)"
+            m = re.search(r'avg-rtt=([\d.]+).*std-dev=([\d.]+)', line)
+            if m:
+                metrics["latency_avg_us"] = float(m.group(1))
+                metrics["latency_stdev_us"] = float(m.group(2))
+                continue
+
+            # "---> percentile NN.NNN =   X"
+            m = re.search(r'percentile\s+([\d.]+)\s+=\s+([\d.]+)', line)
+            if m:
+                pct = float(m.group(1))
+                val = float(m.group(2))
+                key = f"latency_p{pct:.3f}".rstrip("0").rstrip(".").replace(".", "_") + "_us"
+                metrics[key] = val
+                continue
+
+            # "---> <MAX> observation = X"
+            m = re.search(r'<MAX>\s+observation\s+=\s+([\d.]+)', line)
+            if m:
+                metrics["latency_max_us"] = float(m.group(1))
+                continue
+
+            # "---> <MIN> observation = X"
+            m = re.search(r'<MIN>\s+observation\s+=\s+([\d.]+)', line)
+            if m:
+                metrics["latency_min_us"] = float(m.group(1))
+                continue
+
+            # ── Old format ────────────────────────────────────────────────────
+            # "Summary: Latency is X usec"
             m = re.search(r'Summary:\s+Latency is\s+([\d.]+)\s+usec', line)
             if m:
                 metrics["latency_avg_us"] = float(m.group(1))
                 continue
 
-            # Percentile: "Total 99.000 Percentile is X usec"
-            m2 = re.search(r'Total\s+([\d.]+)\s+Percentile is\s+([\d.]+)\s+usec', line)
-            if m2:
-                pct = float(m2.group(1))
-                val = float(m2.group(2))
-                if abs(pct - 50.0) < 0.1:
-                    metrics["latency_p50_us"] = val
-                elif abs(pct - 99.0) < 0.1:
-                    metrics["latency_p99_us"] = val
-                elif abs(pct - 99.9) < 0.1:
-                    metrics["latency_p999_us"] = val
+            # "Total NN.NNN Percentile is X usec"
+            m = re.search(r'Total\s+([\d.]+)\s+Percentile is\s+([\d.]+)\s+usec', line)
+            if m:
+                pct = float(m.group(1))
+                val = float(m.group(2))
+                key = f"latency_p{pct:.3f}".rstrip("0").rstrip(".").replace(".", "_") + "_us"
+                metrics[key] = val
 
         return metrics

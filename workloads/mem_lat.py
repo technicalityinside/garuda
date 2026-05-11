@@ -137,7 +137,7 @@ class MemLat(BaseWorkload):
         Report latency at representative L1/L2/L3/DRAM sizes plus overall min/max.
         """
         pairs: List[Tuple[float, float]] = []
-        for line in stdout.splitlines():
+        for line in (stdout + "\n" + stderr).splitlines():
             line = line.strip()
             if not line or line.startswith('"') or line.startswith('#'):
                 continue
