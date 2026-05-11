@@ -149,11 +149,49 @@ def _configure_kernel(src_dir: str) -> Tuple[bool, str]:
     return True, "Kernel config prepared"
 
 
+_BUILD_DEPS = (
+    "build-essential", "bc", "bison", "flex",
+    "libssl-dev", "libelf-dev", "libdw-dev", "dwarves",
+    "debhelper", "rsync", "libncurses-dev",
+)
+
+
+def _ensure_build_deps() -> Tuple[bool, str]:
+    """Install kernel build dependencies if any are missing."""
+    env = {**os.environ, "DEBIAN_FRONTEND": "noninteractive"}
+    # Check which packages are actually missing before installing
+    missing = []
+    for pkg in _BUILD_DEPS:
+        r = subprocess.run(
+            ["dpkg-query", "-W", "-f=${Status}", pkg],
+            capture_output=True, text=True,
+        )
+        if "install ok installed" not in r.stdout:
+            missing.append(pkg)
+
+    if not missing:
+        return True, "Build dependencies already satisfied"
+
+    print(f"    Installing missing build deps: {' '.join(missing)} ...")
+    r = subprocess.run(
+        ["apt-get", "install", "-y", "--no-install-recommends"] + missing,
+        env=env,
+        timeout=300,
+    )
+    if r.returncode != 0:
+        return False, f"Failed to install build dependencies: {' '.join(missing)}"
+    return True, f"Installed: {' '.join(missing)}"
+
+
 def _build_and_install(src_dir: str) -> Tuple[bool, str, str]:
     """
     Build kernel .deb packages via make bindeb-pkg and install them.
     Returns (ok, message, kernel_release_string).
     """
+    ok, msg = _ensure_build_deps()
+    if not ok:
+        return False, msg, ""
+
     nproc = os.cpu_count() or 1
     print(f"    make -j{nproc} bindeb-pkg  (this may take 30–90 min) ...")
     r = subprocess.run(
