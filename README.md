@@ -63,7 +63,7 @@ tools/
 │   └── state.py                # VMStateStore — persists VM info locally
 ├── kernel_analysis/            # Multi-kernel benchmarking layer
 │   ├── state.py                # AnalysisSession + KernelEntry — persisted JSON state machine
-│   ├── installer.py            # apt kernel install, grub.cfg parser, grub-reboot
+│   ├── installer.py            # apt/GitHub/tarball kernel install, grub.cfg parser, grub-reboot
 │   ├── scorer.py               # Composite score computation + formatted report
 │   └── service.py              # Systemd oneshot service install/remove
 ├── workloads/                  # Drop new .py files here to add workloads
@@ -120,10 +120,10 @@ python3 main.py report --run-id <run_id>
 
 ### Kernel analysis (local)
 
-Automatically install and benchmark across multiple kernel versions. Requires root — uses `grub-reboot` and a systemd service to survive across reboots.
+Automatically install and benchmark across multiple kernel versions. Requires root — uses `grub-reboot` and a systemd service to survive across reboots. Kernels can come from apt, a GitHub branch, or a tar.gz URL.
 
 ```bash
-# Benchmark three kernel versions on fio + stream, push to Kernel Ledger
+# Benchmark three apt kernels on fio + stream, push to Kernel Ledger
 sudo python3 main.py kernel-analyze \
   --kernels 6.8.0-55-generic,6.11.0-25-generic,6.12.0-10-generic \
   --workloads fio,stream,hackbench \
@@ -131,9 +131,19 @@ sudo python3 main.py kernel-analyze \
   --push-url http://perf.example.com \
   --api-key my-secret-key
 
+# Compare an apt kernel against mainline built from GitHub
+sudo python3 main.py kernel-analyze \
+  --kernels 6.8.0-55-generic,github:torvalds/linux:master@v6.15-rc1 \
+  --workloads schbench,hackbench,mem_lat --iterations 3
+
+# Build from a tar.gz URL
+sudo python3 main.py kernel-analyze \
+  --kernels 6.8.0-55-generic,tarball:https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.13.tar.gz@6.13.0 \
+  --workloads fio,stream --iterations 3
+
 # Dry run — see the plan without touching anything
 sudo python3 main.py kernel-analyze \
-  --kernels 6.8.0-55-generic,6.12.0-10-generic \
+  --kernels 6.8.0-55-generic,github:torvalds/linux:master@v6.15-rc1 \
   --workloads fio --dry-run
 
 # Check status of an in-progress analysis
@@ -1332,7 +1342,7 @@ The `results.json` schema:
 
 ## Kernel Analysis
 
-The kernel analysis layer automates cross-kernel performance comparisons. It installs each kernel via `apt`, configures GRUB for a one-time boot (`grub-reboot`), runs the full workload suite after each reboot, and pushes results to the Kernel Ledger. A systemd service handles auto-resume so the workflow survives reboots without manual intervention.
+The kernel analysis layer automates cross-kernel performance comparisons. It installs each kernel (from apt, a GitHub branch, or a tar.gz URL), configures GRUB for a one-time boot (`grub-reboot`), runs the full workload suite after each reboot, and pushes results to the Kernel Ledger. A systemd service handles auto-resume so the workflow survives reboots without manual intervention.
 
 Scores are computed after all kernels complete using a geometric mean of normalised per-metric values. The baseline kernel (first in the list) scores 100; other kernels are shown relative to it.
 
@@ -1352,7 +1362,7 @@ sudo python3 main.py kernel-analyze \
 
 | Flag | Default | Description |
 |---|---|---|
-| `--kernels VER,...` | (required) | Comma-separated kernel versions, e.g. `6.8.0-55-generic,6.12.0-10-generic` |
+| `--kernels SPEC,...` | (required) | Comma-separated kernel specs (see formats below) |
 | `--workloads NAME,...` | (required) | Comma-separated workload names to run on each kernel |
 | `--config PRESET` | `single_core` | Config preset for each workload run (see `list-configs`) |
 | `--iterations N` | `3` | Iterations per workload per kernel |
@@ -1367,10 +1377,29 @@ sudo python3 main.py kernel-analyze \
 | `--resume` | — | Resume an in-progress session (called automatically by systemd) |
 | `--list-kernels` | — | Show kernel packages available via apt and exit |
 
+**Kernel spec formats**
+
+Three install methods can be mixed freely in a single `--kernels` list:
+
+| Format | Install method | Example |
+|---|---|---|
+| `VERSION` | apt (plain version string) | `6.8.0-55-generic` |
+| `apt:VERSION` | apt (explicit) | `apt:6.12.0-10-generic` |
+| `github:REPO:BRANCH[@LABEL]` | git clone + `make bindeb-pkg` | `github:torvalds/linux:master@v6.15-rc1` |
+| `github:URL:BRANCH[@LABEL]` | git clone + `make bindeb-pkg` | `github:https://github.com/owner/linux:stable` |
+| `tarball:URL[@LABEL]` | download + extract + `make bindeb-pkg` | `tarball:https://cdn.kernel.org/.../linux-6.13.tar.gz@6.13.0` |
+
+For GitHub and tarball sources:
+- The optional `@LABEL` suffix sets the display name and run ID label. Without it, a label is derived from the repo/filename.
+- The running kernel's `.config` is copied into the source tree and `make olddefconfig` is run before the build.
+- `make bindeb-pkg` produces `.deb` packages which are installed with `dpkg -i`. The build directory is cached at `/var/cache/garuda/kernel-builds/` — re-running after an interrupted build resumes from the existing clone/source.
+- Build time is typically 30–90 minutes depending on machine speed. Plan accordingly.
+- Required build dependencies: `build-essential bc bison flex libssl-dev libelf-dev`
+
 **How it works:**
 
 ```
-sudo python3 main.py kernel-analyze --kernels 6.8,6.11,6.12 --workloads fio,stream
+sudo python3 main.py kernel-analyze --kernels 6.8,6.11,github:torvalds/linux:master@v6.15 --workloads fio,stream
   │
   ├─ Creates state file at /var/lib/garuda/kernel_analysis.json
   ├─ Installs garuda-kernel-analysis.service (systemd oneshot)
@@ -1383,10 +1412,10 @@ sudo python3 main.py kernel-analyze --kernels 6.8,6.11,6.12 --workloads fio,stre
   ├─ [boot] systemd fires kernel-analyze --resume
   │   ├─ Benchmarks fio, stream on 6.11
   │   ├─ Pushes results
-  │   └─ grub-reboot → reboot into 6.12
+  │   └─ git clone + build v6.15-rc1, grub-reboot → reboot into built kernel
   │
   └─ [boot] systemd fires kernel-analyze --resume
-      ├─ Benchmarks fio, stream on 6.12
+      ├─ Benchmarks fio, stream on v6.15-rc1
       ├─ Pushes results
       ├─ Prints composite score report
       └─ Removes systemd service
@@ -1395,7 +1424,7 @@ sudo python3 main.py kernel-analyze --kernels 6.8,6.11,6.12 --workloads fio,stre
 **Examples:**
 
 ```bash
-# Three kernels, scheduler + memory workloads, 5 iterations, 4-core config
+# Three apt kernels, scheduler + memory workloads, 5 iterations, 4-core config
 sudo python3 main.py kernel-analyze \
   --kernels 6.8.0-55-generic,6.11.0-25-generic,6.12.0-10-generic \
   --workloads schbench,hackbench,stream,mem_lat \
@@ -1403,12 +1432,28 @@ sudo python3 main.py kernel-analyze \
   --push-url http://localhost:8000 --api-key my-key \
   --kernel-config distro-ubuntu
 
-# See what kernels are available to install
+# Compare an apt kernel against mainline from GitHub
+sudo python3 main.py kernel-analyze \
+  --kernels 6.8.0-55-generic,github:torvalds/linux:master@v6.15-rc1 \
+  --workloads schbench,hackbench,mem_lat \
+  --config 4c4t --iterations 3
+
+# Benchmark a custom kernel from a tar.gz tarball
+sudo python3 main.py kernel-analyze \
+  --kernels 6.8.0-55-generic,tarball:https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.13.tar.gz@6.13.0 \
+  --workloads fio,stream --config 4c4t --iterations 5
+
+# Mix all three source types
+sudo python3 main.py kernel-analyze \
+  --kernels "6.8.0-55-generic,github:torvalds/linux:master@mainline,tarball:https://example.com/linux-custom.tar.gz@custom" \
+  --workloads schbench,stream,fio --config 4c4t --iterations 3
+
+# See what kernels are available to install via apt
 python3 main.py kernel-analyze --list-kernels
 
-# Dry run — shows which kernels need installation
+# Dry run — shows which kernels need installation and how
 sudo python3 main.py kernel-analyze \
-  --kernels 6.8.0-55-generic,6.12.0-10-generic --workloads fio --dry-run
+  --kernels 6.8.0-55-generic,github:torvalds/linux:master@v6.15-rc1 --workloads fio --dry-run
 
 # Check progress mid-analysis
 sudo python3 main.py kernel-analyze --status
@@ -1452,7 +1497,7 @@ Accepts all standard `--provider` / VM configuration flags (same as `cloud-run`)
 
 | Flag | Default | Description |
 |---|---|---|
-| `--kernels VER,...` | (required) | Comma-separated kernel versions to test |
+| `--kernels SPEC,...` | (required) | Comma-separated kernel specs (apt version, `github:REPO:BRANCH[@label]`, or `tarball:URL[@label]`) |
 | `--workloads NAME,...` | (required) | Comma-separated workload names |
 | `--config PRESET` | `single_core` | Config preset for workload runs |
 | `--iterations N` | `3` | Iterations per workload per kernel |
