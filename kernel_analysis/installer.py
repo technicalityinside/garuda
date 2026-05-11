@@ -163,7 +163,7 @@ def _configure_kernel(src_dir: str) -> Tuple[bool, str]:
 _BUILD_DEPS = (
     "build-essential", "bc", "bison", "flex",
     "libssl-dev", "libelf-dev", "libdw-dev", "dwarves",
-    "debhelper", "rsync", "libncurses-dev",
+    "debhelper", "rsync", "libncurses-dev", "gawk",
 )
 
 
