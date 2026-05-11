@@ -40,8 +40,8 @@ class CyclicTest(BaseWorkload):
         return {
             "loops":       100_000,  # -l: measurement loops per thread
             "interval_us": 1_000,    # -i: timer interval in microseconds
-            "priority":    99,        # -p: RT SCHED_FIFO priority (needs root)
-            "mlockall":    True,      # -m: lock memory pages (needs root)
+            "priority":    99,       # -p: RT SCHED_FIFO priority (root only)
+            "mlockall":    True,     # -m: lock memory pages (root only)
         }
 
     @property
@@ -49,9 +49,15 @@ class CyclicTest(BaseWorkload):
         return "package manager (apt install rt-tests)"
 
     def validate(self) -> Tuple[bool, str]:
-        if shutil.which("cyclictest"):
-            return True, f"cyclictest found: {shutil.which('cyclictest')}"
-        return False, "cyclictest not found in PATH. Install: apt install rt-tests"
+        if not shutil.which("cyclictest"):
+            return False, "cyclictest not found in PATH. Install: apt install rt-tests"
+        if os.geteuid() != 0:
+            return False, (
+                "cyclictest requires root (rt-tests >= 2.x always calls "
+                "sched_setscheduler regardless of --policy). "
+                "Run: sudo python3 main.py ..."
+            )
+        return True, f"cyclictest found: {shutil.which('cyclictest')}"
 
     def install(self, install_dir: str, force: bool = False) -> Tuple[bool, str]:
         if not force and shutil.which("cyclictest"):
@@ -62,7 +68,6 @@ class CyclicTest(BaseWorkload):
         cfg = {**self.default_workload_args(), **config.workload_args}
         cmd = [
             "cyclictest",
-            "--nanosleep",
             "--quiet",
             f"--loops={int(cfg['loops'])}",
             f"--interval={int(cfg['interval_us'])}",
