@@ -2503,19 +2503,32 @@ def build_parser() -> argparse.ArgumentParser:
         help="Provision a cloud VM and run kernel-analyze across multiple kernel versions",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
-            Provisions a single VM, pre-installs all kernels via apt, then runs
-            kernel-analyze on the VM.  A systemd service on the VM handles grub-reboot
-            and auto-resume after each kernel switch.  The orchestrator polls SSH every
-            30 s, reconnecting transparently across reboots, until all kernels are done.
+            Provisions a single VM, pre-installs all kernels, then runs kernel-analyze
+            on the VM.  A systemd service on the VM handles grub-reboot and auto-resume
+            after each kernel switch.  The orchestrator polls SSH every 30 s,
+            reconnecting transparently across reboots, until all kernels are done.
             Results are fetched locally and a composite score report is printed.
 
+            Kernel spec formats (--kernels):
+              6.8.0-55-generic                        apt install
+              apt:6.8.0-55-generic                    apt install (explicit)
+              github:owner/repo:branch[@label]        git clone + make bindeb-pkg
+              github:https://github.com/o/r:branch    git clone (full URL)
+              tarball:https://example.com/k.tar.gz[@label]  download + make bindeb-pkg
+
             Examples:
-              # GCP — three kernels, fio + stream, auto-push to Kernel Ledger
+              # GCP — three apt kernels, fio + stream, auto-push to Kernel Ledger
               python main.py cloud-kernel-analyze --provider gcp --region us-central1 \\
                 --instance-type n2-standard-4 \\
                 --kernels 6.8.0-55-generic,6.11.0-25-generic,6.12.0-10-generic \\
                 --workloads fio,stream --iterations 5 \\
                 --push-url http://perf.example.com --api-key my-key
+
+              # GCP — apt kernel vs mainline from GitHub
+              python main.py cloud-kernel-analyze --provider gcp --region us-central1 \\
+                --instance-type n2-standard-8 \\
+                --kernels 6.8.0-55-generic,github:torvalds/linux:master@v6.15-rc1 \\
+                --workloads schbench,hackbench,mem_lat --config 4c4t --iterations 3
 
               # AWS — keep VM running after analysis
               python main.py cloud-kernel-analyze --provider aws --region us-east-1 \\
@@ -2527,9 +2540,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
     _add_vm_args(p_cka)
     p_cka.add_argument(
-        "--kernels", required=True, metavar="VER,VER,...",
-        help="Comma-separated kernel version strings to test, "
-             "e.g. 6.8.0-55-generic,6.12.0-10-generic",
+        "--kernels", required=True, metavar="SPEC,SPEC,...",
+        help="Comma-separated kernel specs: plain version (apt), "
+             "github:owner/repo:branch[@label], or tarball:URL[@label]",
     )
     p_cka.add_argument(
         "--workloads", required=True, metavar="NAME,NAME,...",
@@ -2576,12 +2589,24 @@ def build_parser() -> argparse.ArgumentParser:
         help="Benchmark workloads across multiple kernel versions, push to Kernel Ledger",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=textwrap.dedent("""\
-            Requires root (sudo).  Installs kernels via apt, uses grub-reboot for
-            one-time boot switching, and installs a systemd service that auto-resumes
-            after each reboot.
+            Requires root (sudo).  Installs kernels (apt, GitHub clone, or tarball),
+            uses grub-reboot for one-time boot switching, and installs a systemd
+            service that auto-resumes after each reboot.
+
+            Kernel spec formats (--kernels):
+              6.8.0-55-generic                        apt install
+              apt:6.8.0-55-generic                    apt install (explicit)
+              github:owner/repo:branch[@label]        git clone + make bindeb-pkg
+              github:https://github.com/o/r:branch    git clone (full URL)
+              tarball:https://example.com/k.tar.gz[@label]  download + make bindeb-pkg
+
+            The optional @label suffix sets the display name for github/tarball specs.
+            Source builds use the running kernel's .config (make olddefconfig) and
+            cache the clone/source tree under /var/cache/garuda/kernel-builds/.
+            Build deps: build-essential bc bison flex libssl-dev libelf-dev
 
             Examples:
-              # Analyze three kernels, run fio + stream, push results
+              # Three apt kernels, fio + stream, push results
               sudo python3 main.py kernel-analyze \\
                 --kernels 6.8.0-55-generic,6.11.0-25-generic,6.12.0-10-generic \\
                 --workloads fio,stream \\
@@ -2589,17 +2614,20 @@ def build_parser() -> argparse.ArgumentParser:
                 --push-url http://localhost:8000 \\
                 --api-key my-secret-key
 
-              # Use a specific config preset and custom kernel label
+              # apt kernel vs mainline from GitHub
               sudo python3 main.py kernel-analyze \\
-                --kernels 6.8.0-55-generic,6.12.0-10-generic \\
-                --workloads hackbench,schbench,stream \\
-                --config 4c4t --iterations 3 \\
-                --kernel-config distro-ubuntu \\
-                --push-url http://perf.example.com
+                --kernels 6.8.0-55-generic,github:torvalds/linux:master@v6.15-rc1 \\
+                --workloads schbench,hackbench,mem_lat \\
+                --config 4c4t --iterations 3
+
+              # apt kernel vs a tarball download
+              sudo python3 main.py kernel-analyze \\
+                --kernels "6.8.0-55-generic,tarball:https://cdn.kernel.org/pub/linux/kernel/v6.x/linux-6.13.tar.gz@6.13.0" \\
+                --workloads fio,stream --config 4c4t --iterations 3
 
               # Dry run to see the plan without touching anything
               sudo python3 main.py kernel-analyze \\
-                --kernels 6.8.0-55-generic,6.12.0-10-generic \\
+                --kernels 6.8.0-55-generic,github:torvalds/linux:master@v6.15-rc1 \\
                 --workloads fio --dry-run
 
               # Show current session state
@@ -2608,7 +2636,7 @@ def build_parser() -> argparse.ArgumentParser:
               # Abort an in-progress session
               sudo python3 main.py kernel-analyze --abort
 
-              # List kernel packages available to install
+              # List kernel packages available to install via apt
               python3 main.py kernel-analyze --list-kernels
         """),
     )
@@ -2632,9 +2660,9 @@ def build_parser() -> argparse.ArgumentParser:
     )
 
     p_ka.add_argument(
-        "--kernels", metavar="VER,VER,...",
-        help="Comma-separated kernel version strings to test, e.g. "
-             "6.8.0-55-generic,6.12.0-10-generic",
+        "--kernels", metavar="SPEC,SPEC,...",
+        help="Comma-separated kernel specs: plain version (apt), "
+             "github:owner/repo:branch[@label], or tarball:URL[@label]",
     )
     p_ka.add_argument(
         "--workloads", metavar="NAME,NAME,...",
