@@ -419,6 +419,34 @@ def cmd_multi_run(args, topo):
             print(f"  {wl.name}/{cfg.name:<24}  {suc:<10}  {rid}")
     print()
 
+    # ── Optional push to Kernel Ledger ─────────────────────────────────────────
+    push_url = getattr(args, "push_url", None)
+    if push_url and n_ok > 0:
+        run_ids = [
+            cell["run_id"]
+            for wl in workloads
+            for cfg in configs
+            for cell in [matrix[wl.name].get(cfg.name, {})]
+            if cell.get("ok") and cell.get("run_id")
+        ]
+        print(f"Pushing {len(run_ids)} run(s) to {push_url} ...")
+        system_payload, kernel_payload, snap = _build_push_context(
+            system_name=getattr(args, "system_name", None),
+            kernel_version=getattr(args, "kernel", None),
+            kernel_config=getattr(args, "kernel_config", "unknown"),
+            topo=topo,
+        )
+        pushed, groups = _push_run_ids(
+            run_ids=run_ids,
+            url=push_url,
+            api_key=getattr(args, "api_key", ""),
+            system_payload=system_payload,
+            kernel_payload=kernel_payload,
+            snap=snap,
+            results_root=RESULTS_DIR,
+        )
+        print(f"\nPushed {pushed}/{groups} run group(s) to {push_url}")
+
 
 def cmd_scaling(args, topo):
     """Run a scaling study."""
@@ -944,35 +972,16 @@ def _ka_print_local_scores():
 
 # ── Portal push ────────────────────────────────────────────────────────────
 
-def cmd_push(args, topo):
-    """Push saved benchmark results to a Garuda portal instance."""
+def _build_push_context(system_name: Optional[str], kernel_version: Optional[str],
+                        kernel_config: str, topo) -> tuple:
+    """
+    Return (system_payload, kernel_payload, snap) ready for the push API.
+    All values are auto-detected when not explicitly provided.
+    """
     import json
     import platform
     import subprocess
-    import urllib.error
-    import urllib.request
 
-    results_root = os.path.join(_ROOT, "results")
-
-    # Resolve which run to push
-    if args.run_id:
-        run_dirs = [os.path.join(results_root, args.run_id)]
-    else:
-        if not os.path.isdir(results_root):
-            print("No results/ directory found.", file=sys.stderr)
-            sys.exit(1)
-        candidates = sorted(
-            (d for d in os.listdir(results_root)
-             if os.path.isfile(os.path.join(results_root, d, "results.json"))),
-            key=lambda d: os.path.getmtime(os.path.join(results_root, d, "results.json"))
-        )
-        if not candidates:
-            print("No saved runs found in results/.", file=sys.stderr)
-            sys.exit(1)
-        run_dirs = [os.path.join(results_root, candidates[-1])]
-        print(f"Using most recent run: {candidates[-1]}")
-
-    # Gather system info
     cpu_model = "unknown"
     try:
         out = subprocess.run(["lscpu"], capture_output=True, text=True, timeout=5).stdout
@@ -993,17 +1002,6 @@ def cmd_push(args, topo):
     except Exception:
         pass
 
-    system_name = args.system_name or platform.node()
-    system_payload = {
-        "name":       system_name,
-        "cpu_model":  cpu_model,
-        "arch":       platform.machine(),
-        "memory_gb":  memory_gb,
-        "numa_nodes": topo.total_numa_nodes if topo else 1,
-    }
-
-    # Kernel version
-    kernel_version = args.kernel
     if not kernel_version:
         try:
             kernel_version = subprocess.run(
@@ -1012,31 +1010,48 @@ def cmd_push(args, topo):
         except Exception:
             kernel_version = "unknown"
 
+    system_payload = {
+        "name":       system_name or platform.node(),
+        "cpu_model":  cpu_model,
+        "arch":       platform.machine(),
+        "memory_gb":  memory_gb,
+        "numa_nodes": topo.total_numa_nodes if topo else 1,
+    }
     kernel_payload = {
         "version":     kernel_version,
-        "config_name": args.kernel_config or "unknown",
+        "config_name": kernel_config or "unknown",
     }
-
     snap = collect_system_snapshot(topo)
+    return system_payload, kernel_payload, snap
 
-    url = args.url.rstrip("/") + "/api/runs"
+
+def _push_run_ids(run_ids: List[str], url: str, api_key: str,
+                  system_payload: dict, kernel_payload: dict,
+                  snap: dict, results_root: str) -> tuple:
+    """
+    Push a list of local run IDs to the Kernel Ledger.
+    Returns (total_pushed, total_groups).
+    """
+    import json
+    import urllib.error
+    import urllib.request
+
+    endpoint = url.rstrip("/") + "/api/runs"
     total_pushed = 0
     total_groups = 0
 
-    for run_dir in run_dirs:
+    for run_id in run_ids:
+        run_dir      = os.path.join(results_root, run_id)
         results_file = os.path.join(run_dir, "results.json")
         if not os.path.isfile(results_file):
-            print(f"  Skipping {run_dir}: no results.json", file=sys.stderr)
+            print(f"  Skipping {run_id}: no results.json", file=sys.stderr)
             continue
 
         with open(results_file) as fh:
             saved = json.load(fh)
 
-        run_items = saved.get("results", [])
-
-        # Group by (workload, config_name) — each group becomes one API push
         groups: Dict = {}
-        for item in run_items:
+        for item in saved.get("results", []):
             key = (item.get("workload", "unknown"), item.get("config_name") or "")
             groups.setdefault(key, []).append(item)
 
@@ -1071,30 +1086,67 @@ def cmd_push(args, topo):
                 "results":         result_entries,
             }
 
-            data = json.dumps(payload, default=str).encode()
+            data    = json.dumps(payload, default=str).encode()
             headers = {"Content-Type": "application/json"}
-            if args.api_key:
-                headers["Authorization"] = f"Bearer {args.api_key}"
-            req  = urllib.request.Request(
-                url, data=data,
-                headers=headers,
-                method="POST",
-            )
+            if api_key:
+                headers["Authorization"] = f"Bearer {api_key}"
+
+            req = urllib.request.Request(endpoint, data=data, headers=headers, method="POST")
             try:
                 with urllib.request.urlopen(req, timeout=30) as resp:
                     body = json.loads(resp.read())
-                    print(
-                        f"  ✓ {workload}/{config_preset or 'default'}"
-                        f"  →  run_id={body['run_id']}"
-                    )
+                    print(f"  ✓ {workload}/{config_preset or 'default'}"
+                          f"  →  run_id={body['run_id']}")
                     total_pushed += 1
             except urllib.error.HTTPError as exc:
                 detail = exc.read().decode(errors="replace")
-                print(f"  ✗ {workload}/{config_preset}: HTTP {exc.code} — {detail}", file=sys.stderr)
+                print(f"  ✗ {workload}/{config_preset}: HTTP {exc.code} — {detail}",
+                      file=sys.stderr)
             except Exception as exc:
                 print(f"  ✗ {workload}/{config_preset}: {exc}", file=sys.stderr)
 
-    print(f"\nPushed {total_pushed}/{total_groups} run group(s) to {args.url}")
+    return total_pushed, total_groups
+
+
+def cmd_push(args, topo):
+    """Push saved benchmark results to a Garuda portal instance."""
+    results_root = os.path.join(_ROOT, "results")
+
+    # Resolve which run(s) to push
+    if args.run_id:
+        run_ids = [args.run_id]
+    else:
+        if not os.path.isdir(results_root):
+            print("No results/ directory found.", file=sys.stderr)
+            sys.exit(1)
+        candidates = sorted(
+            (d for d in os.listdir(results_root)
+             if os.path.isfile(os.path.join(results_root, d, "results.json"))),
+            key=lambda d: os.path.getmtime(os.path.join(results_root, d, "results.json"))
+        )
+        if not candidates:
+            print("No saved runs found in results/.", file=sys.stderr)
+            sys.exit(1)
+        run_ids = [candidates[-1]]
+        print(f"Using most recent run: {candidates[-1]}")
+
+    system_payload, kernel_payload, snap = _build_push_context(
+        system_name=args.system_name,
+        kernel_version=args.kernel,
+        kernel_config=args.kernel_config,
+        topo=topo,
+    )
+
+    pushed, groups = _push_run_ids(
+        run_ids=run_ids,
+        url=args.url,
+        api_key=args.api_key,
+        system_payload=system_payload,
+        kernel_payload=kernel_payload,
+        snap=snap,
+        results_root=results_root,
+    )
+    print(f"\nPushed {pushed}/{groups} run group(s) to {args.url}")
 
 
 # ── System snapshot ────────────────────────────────────────────────────────
@@ -2145,6 +2197,12 @@ def build_parser() -> argparse.ArgumentParser:
               # Dry run to preview commands without executing
               python main.py multi-run --workloads stream,fio \\
                 --configs single_core,full_socket --dry-run
+
+              # Run matrix then push all results to Kernel Ledger
+              python main.py multi-run \\
+                --workloads stream,sysbench_cpu,python_bench \\
+                --configs single_core,full_socket --iterations 3 \\
+                --push-url http://perf.example.com --api-key my-key
         """),
     )
     p_mr.add_argument(
@@ -2173,6 +2231,29 @@ def build_parser() -> argparse.ArgumentParser:
     p_mr.add_argument(
         "--stop-on-error", action="store_true",
         help="Abort the matrix after the first failed combination",
+    )
+    p_mr_push = p_mr.add_argument_group("Kernel Ledger push (optional)")
+    p_mr_push.add_argument(
+        "--push-url", metavar="URL",
+        help="Push all successful runs to this Kernel Ledger URL after the matrix completes "
+             "(e.g. http://perf.example.com)",
+    )
+    p_mr_push.add_argument(
+        "--api-key", metavar="KEY",
+        default=os.environ.get("GARUDA_API_KEY", ""),
+        help="Kernel Ledger push API key (default: $GARUDA_API_KEY)",
+    )
+    p_mr_push.add_argument(
+        "--kernel", metavar="VERSION",
+        help="Kernel version string to tag results with (default: output of 'uname -r')",
+    )
+    p_mr_push.add_argument(
+        "--kernel-config", metavar="LABEL", default="unknown",
+        help="Kernel config label stored in the ledger (default: unknown)",
+    )
+    p_mr_push.add_argument(
+        "--system-name", metavar="NAME",
+        help="Override the system name in the ledger (default: hostname)",
     )
 
     # scaling
