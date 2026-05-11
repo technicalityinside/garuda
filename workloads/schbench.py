@@ -8,7 +8,7 @@ Subsystem: CPU Scheduling
 
 Requirements
 ------------
-  schbench  (apt install schbench)
+  schbench  (apt install schbench  — or built from source automatically)
 """
 
 import os
@@ -29,42 +29,8 @@ from benchmark_toolkit.config import BenchmarkConfig
 from benchmark_toolkit.sysutils import PackageInstaller
 
 
-class SchBench(BaseWorkload):
-    name        = "schbench"
-    description = "Scheduler wakeup-latency benchmark (schbench)"
-    version     = "1.0"
-
-    def default_workload_args(self) -> Dict:
-        return {
-            "message_threads": 2,   # -m: message-passer threads
-            "worker_threads":  16,  # -t: worker threads per message-passer
-            "runtime":         30,  # -r: runtime in seconds
-        }
-
-    @property
-    def install_hint(self) -> str:
-        return "package manager (apt install schbench)"
-
-    def validate(self) -> Tuple[bool, str]:
-        if shutil.which("schbench"):
-            return True, f"schbench found: {shutil.which('schbench')}"
-        return False, "schbench not found in PATH. Install: apt install schbench"
-
-    def install(self, install_dir: str, force: bool = False) -> Tuple[bool, str]:
-        if not force and shutil.which("schbench"):
-            return True, f"Already installed: {shutil.which('schbench')}"
-
-        # Try package manager first (available on some distros)
-        ok, msg = PackageInstaller.ensure_tools(("schbench", "schbench"))
-        if ok:
-            return True, msg
-
-        # Package not in repos — build from source (single C file, no extra deps)
-        print("  Package not available in repos — building schbench from source...")
-        return _build_schbench(install_dir)
-
-
 def _build_schbench(install_dir: str) -> Tuple[bool, str]:
+    """Clone schbench from kernel.org (or GitHub mirror) and compile it."""
     ok, msg = PackageInstaller.ensure_tools(("gcc", "gcc"), ("make", "make"), ("git", "git"))
     if not ok:
         return False, f"Build deps unavailable: {msg}"
@@ -98,6 +64,41 @@ def _build_schbench(install_dir: str) -> Tuple[bool, str]:
         return True, f"Built from source and installed: {dest}"
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class SchBench(BaseWorkload):
+    name        = "schbench"
+    description = "Scheduler wakeup-latency benchmark (schbench)"
+    version     = "1.0"
+
+    def default_workload_args(self) -> Dict:
+        return {
+            "message_threads": 2,   # -m: message-passer threads
+            "worker_threads":  16,  # -t: worker threads per message-passer
+            "runtime":         30,  # -r: runtime in seconds
+        }
+
+    @property
+    def install_hint(self) -> str:
+        return "package manager or source build"
+
+    def validate(self) -> Tuple[bool, str]:
+        if shutil.which("schbench"):
+            return True, f"schbench found: {shutil.which('schbench')}"
+        return False, "schbench not found in PATH. Run: python3 main.py setup --workload schbench"
+
+    def install(self, install_dir: str, force: bool = False) -> Tuple[bool, str]:
+        if not force and shutil.which("schbench"):
+            return True, f"Already installed: {shutil.which('schbench')}"
+
+        # Try package manager first (available on some distros)
+        ok, msg = PackageInstaller.ensure_tools(("schbench", "schbench"))
+        if ok:
+            return True, msg
+
+        # Package not in repos — build from source (single C file, no extra deps)
+        print("  Package not available in repos — building schbench from source...")
+        return _build_schbench(install_dir)
 
     def build_command(self, config: BenchmarkConfig) -> List[str]:
         cfg = {**self.default_workload_args(), **config.workload_args}

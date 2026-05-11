@@ -9,7 +9,7 @@ Subsystem: Virtual Filesystem (VFS, dentry cache, inode allocation)
 
 Requirements
 ------------
-  fs_mark  (apt install fs-mark)
+  fs_mark  (apt install fs-mark  — or built from source automatically)
 """
 
 import os
@@ -32,47 +32,8 @@ from benchmark_toolkit.sysutils import PackageInstaller
 _WORK_SUBDIR = "fs_mark_work"
 
 
-class FsMark(BaseWorkload):
-    name        = "fs_mark"
-    description = "VFS metadata throughput benchmark (fs_mark)"
-    version     = "1.0"
-
-    _target_dir: str = "/tmp/fs_mark_work"
-
-    def default_workload_args(self) -> Dict:
-        return {
-            "num_files":   4096,     # -n: files created per iteration
-            "file_size":   4096,     # -s: file size in bytes (0 = metadata-only)
-            "iterations":  5,        # -L: number of create-sync-delete cycles
-            "dir":         "",       # -d: working directory (default: work_dir subdir)
-            "subdirs":     0,        # -D: number of subdirectories (0 = flat)
-            "sync_writes": True,     # -S: fsync each file after write
-        }
-
-    @property
-    def install_hint(self) -> str:
-        return "package manager (apt install fs-mark)"
-
-    def validate(self) -> Tuple[bool, str]:
-        if shutil.which("fs_mark"):
-            return True, f"fs_mark found: {shutil.which('fs_mark')}"
-        return False, "fs_mark not found in PATH. Install: apt install fs-mark"
-
-    def install(self, install_dir: str, force: bool = False) -> Tuple[bool, str]:
-        if not force and shutil.which("fs_mark"):
-            return True, f"Already installed: {shutil.which('fs_mark')}"
-
-        # Try package manager first (available on some older distros as fs-mark)
-        ok, msg = PackageInstaller.ensure_tools(("fs_mark", "fs-mark"))
-        if ok:
-            return True, msg
-
-        # Package not in repos — build from source
-        print("  Package not available in repos — building fs_mark from source...")
-        return _build_fs_mark(install_dir)
-
-
 def _build_fs_mark(install_dir: str) -> Tuple[bool, str]:
+    """Clone fs_mark from GitHub and compile it."""
     ok, msg = PackageInstaller.ensure_tools(("gcc", "gcc"), ("make", "make"), ("git", "git"))
     if not ok:
         return False, f"Build deps unavailable: {msg}"
@@ -106,6 +67,46 @@ def _build_fs_mark(install_dir: str) -> Tuple[bool, str]:
         return True, f"Built from source and installed: {dest}"
     finally:
         shutil.rmtree(tmpdir, ignore_errors=True)
+
+
+class FsMark(BaseWorkload):
+    name        = "fs_mark"
+    description = "VFS metadata throughput benchmark (fs_mark)"
+    version     = "1.0"
+
+    _target_dir: str = "/tmp/fs_mark_work"
+
+    def default_workload_args(self) -> Dict:
+        return {
+            "num_files":   4096,     # -n: files created per iteration
+            "file_size":   4096,     # -s: file size in bytes (0 = metadata-only)
+            "iterations":  5,        # -L: number of create-sync-delete cycles
+            "dir":         "",       # -d: working directory (default: work_dir subdir)
+            "subdirs":     0,        # -D: number of subdirectories (0 = flat)
+            "sync_writes": True,     # -S: fsync each file after write
+        }
+
+    @property
+    def install_hint(self) -> str:
+        return "package manager or source build"
+
+    def validate(self) -> Tuple[bool, str]:
+        if shutil.which("fs_mark"):
+            return True, f"fs_mark found: {shutil.which('fs_mark')}"
+        return False, "fs_mark not found in PATH. Run: python3 main.py setup --workload fs_mark"
+
+    def install(self, install_dir: str, force: bool = False) -> Tuple[bool, str]:
+        if not force and shutil.which("fs_mark"):
+            return True, f"Already installed: {shutil.which('fs_mark')}"
+
+        # Try package manager first (available on some older distros as fs-mark)
+        ok, msg = PackageInstaller.ensure_tools(("fs_mark", "fs-mark"))
+        if ok:
+            return True, msg
+
+        # Package not in repos — build from source
+        print("  Package not available in repos — building fs_mark from source...")
+        return _build_fs_mark(install_dir)
 
     # ── Lifecycle ──────────────────────────────────────────────────────────────
 
