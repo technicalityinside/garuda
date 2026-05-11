@@ -7,6 +7,7 @@ Subcommands:
   list-configs            List all config presets for the current system
   validate                Validate workload dependencies
   run                     Run a workload with a given config
+  multi-run               Run multiple workloads × multiple configs (matrix)
   scaling                 Run a scaling study
   report                  Show or export saved results
 
@@ -239,6 +240,184 @@ def cmd_run(args, topo):
         print("  (no successful results)")
 
     print(f"\nResults saved to: {RESULTS_DIR}/{run_id}/results.json")
+
+
+def cmd_multi_run(args, topo):
+    """Run multiple workloads across multiple configurations (full matrix)."""
+    workload_names = [w.strip() for w in args.workloads.split(",") if w.strip()]
+    if not workload_names:
+        print("Error: --workloads produced an empty list.", file=sys.stderr)
+        sys.exit(1)
+
+    workload_args = _parse_workload_args(args.arg)
+    presets = ConfigPreset.all_presets(topo)
+
+    # ── Resolve configs ────────────────────────────────────────────────────────
+    configs: List[BenchmarkConfig] = []
+    if getattr(args, "configs", None):
+        config_names = [c.strip() for c in args.configs.split(",") if c.strip()]
+        for name in config_names:
+            if name not in presets:
+                print(f"Error: Unknown config preset {name!r}")
+                print(f"Available: {', '.join(sorted(presets))}")
+                sys.exit(1)
+            cfg = presets[name]
+            cfg.iterations = args.iterations
+            cfg.workload_args = {**cfg.workload_args, **workload_args}
+            configs.append(cfg)
+    elif getattr(args, "threads", None):
+        try:
+            thread_counts = [int(x) for x in str(args.threads).split(",")]
+        except ValueError:
+            print(f"Error: --threads must be comma-separated integers, got {args.threads!r}", file=sys.stderr)
+            sys.exit(1)
+        for t in thread_counts:
+            cpu_list = topo.get_n_cpus(t)
+            configs.append(BenchmarkConfig(
+                name=f"custom_{t}t",
+                num_threads=t,
+                cpu_list=cpu_list,
+                iterations=args.iterations,
+                description=f"Custom: {t} threads",
+                workload_args=workload_args,
+            ))
+    else:
+        cfg = ConfigPreset.single_core(topo)
+        cfg.iterations = args.iterations
+        cfg.workload_args = workload_args
+        configs.append(cfg)
+
+    # ── Resolve workloads ──────────────────────────────────────────────────────
+    workloads = []
+    for name in workload_names:
+        try:
+            workloads.append(registry.get(name))
+        except KeyError as e:
+            print(f"Error: {e}")
+            sys.exit(1)
+
+    # ── Validate all upfront ───────────────────────────────────────────────────
+    if not args.dry_run:
+        failures = []
+        for wl in workloads:
+            ok, msg = wl.validate()
+            if not ok:
+                failures.append(f"  {wl.name}: {msg}")
+        if failures:
+            print("Validation failed:")
+            for m in failures:
+                print(m)
+            sys.exit(1)
+
+    total = len(workloads) * len(configs)
+    print(f"\nMulti-run: {len(workloads)} workload(s) × {len(configs)} config(s) = {total} run(s)")
+    print(f"  Workloads : {', '.join(w.name for w in workloads)}")
+    print(f"  Configs   : {', '.join(c.name for c in configs)}")
+    print(f"  Iterations: {args.iterations}")
+    if args.dry_run:
+        print("  [DRY RUN MODE]")
+    print()
+
+    runner = BenchmarkRunner(
+        work_dir=args.work_dir,
+        dry_run=args.dry_run,
+        verbose=args.verbose,
+        bin_dir=BIN_DIR,
+    )
+    collector = ResultsCollector(results_dir=RESULTS_DIR)
+
+    # matrix[wl_name][cfg_name] -> {ok, run_id, summary, success_str}
+    matrix: Dict[str, Dict] = {wl.name: {} for wl in workloads}
+    n_done = 0
+    n_ok   = 0
+    stopped_early = False
+
+    for wl in workloads:
+        if stopped_early:
+            break
+        for cfg in configs:
+            n_done += 1
+            print(f"[{n_done}/{total}] {wl.name} / {cfg.name}  "
+                  f"({cfg.num_threads} thread(s), {args.iterations} iter)")
+
+            results = runner.run(wl, cfg)
+
+            if args.dry_run:
+                matrix[wl.name][cfg.name] = {
+                    "ok": True, "run_id": None, "summary": {}, "success_str": "dry-run",
+                }
+                continue
+
+            run_id   = collector.save(results)
+            summary  = collector.summarize(results)
+            n_success = sum(1 for r in results if r.success)
+            ok = n_success > 0
+            if ok:
+                n_ok += 1
+
+            matrix[wl.name][cfg.name] = {
+                "ok":          ok,
+                "run_id":      run_id,
+                "summary":     summary,
+                "success_str": f"{n_success}/{args.iterations}",
+            }
+
+            if not args.verbose:
+                for r in results:
+                    status = "OK" if r.success else "FAIL"
+                    line = f"  iter={r.iteration} [{status}] wall={r.wall_time:.2f}s"
+                    if r.success and r.metrics:
+                        parts = [f"{k}={v:.4g}" for k, v in r.metrics.items()]
+                        line += f"  {', '.join(parts)}"
+                    elif r.error_msg:
+                        line += f"  {r.error_msg}"
+                    print(line)
+            print()
+
+            if getattr(args, "stop_on_error", False) and not ok:
+                print(f"Stopping after failure in {wl.name}/{cfg.name} (--stop-on-error)")
+                stopped_early = True
+                break
+
+    if args.dry_run:
+        return
+
+    # ── Summary matrix ─────────────────────────────────────────────────────────
+    print(f"\n{'─' * 64}")
+    print(f"Multi-run complete: {n_ok}/{n_done} combination(s) succeeded")
+    print(f"{'─' * 64}\n")
+
+    cfg_names = [c.name for c in configs]
+    wl_col  = max(max(len(w.name) for w in workloads), len("Workload")) + 2
+    val_col = max(max(len(n) for n in cfg_names), 14) + 2
+
+    # Header row
+    header = f"{'Workload':<{wl_col}}" + "".join(f"{n:>{val_col}}" for n in cfg_names)
+    print("Primary metric (mean) per cell:")
+    print(header)
+    print("─" * len(header))
+
+    for wl in workloads:
+        row = f"{wl.name:<{wl_col}}"
+        for cfg in configs:
+            cell    = matrix[wl.name].get(cfg.name, {})
+            summary = cell.get("summary") or {}
+            if not cell.get("ok") or not summary:
+                row += f"{'—':>{val_col}}"
+            else:
+                _, stats = next(iter(summary.items()))
+                row += f"{stats['mean']:.4g}".rjust(val_col)
+        print(row)
+
+    print()
+    print("Run IDs:")
+    for wl in workloads:
+        for cfg in configs:
+            cell = matrix[wl.name].get(cfg.name, {})
+            rid  = cell.get("run_id") or "—"
+            suc  = cell.get("success_str") or "—"
+            print(f"  {wl.name}/{cfg.name:<24}  {suc:<10}  {rid}")
+    print()
 
 
 def cmd_scaling(args, topo):
@@ -1865,6 +2044,8 @@ def build_parser() -> argparse.ArgumentParser:
               python main.py validate --workload sysbench_cpu
               python main.py run --workload python_bench --config full_socket --iterations 3
               python main.py run --workload sysbench_cpu --threads 8 --arg time=30 prime=50000
+              python main.py multi-run --workloads stream,sysbench_cpu --configs single_core,full_socket --iterations 3
+              python main.py multi-run --workloads hackbench,schbench --threads 1,4,8,16
               python main.py scaling --workload python_bench --mode powers_of_2
               python main.py scaling --workload python_bench --threads 1,2,4,8,16
               python main.py report --list
@@ -1935,6 +2116,63 @@ def build_parser() -> argparse.ArgumentParser:
     p_run.add_argument(
         "--arg", nargs="*", metavar="key=value",
         help="Workload-specific arguments, e.g. --arg time=30 prime=50000",
+    )
+
+    # multi-run
+    p_mr = subparsers.add_parser(
+        "multi-run",
+        help="Run multiple workloads × multiple configs in one shot",
+        formatter_class=argparse.RawDescriptionHelpFormatter,
+        epilog=textwrap.dedent("""\
+            Runs every (workload, config) combination and prints a result matrix.
+
+            Examples:
+              # All combinations, 3 iterations each
+              python main.py multi-run \\
+                --workloads stream,sysbench_cpu,python_bench \\
+                --configs single_core,full_socket \\
+                --iterations 3
+
+              # Custom thread counts instead of named presets
+              python main.py multi-run \\
+                --workloads hackbench,schbench \\
+                --threads 1,4,8,16 --iterations 5
+
+              # Single workload, all configs — quick matrix
+              python main.py multi-run --workloads fio \\
+                --configs 1c1t,1c2t,2c2t,4c4t --arg rw=read
+
+              # Dry run to preview commands without executing
+              python main.py multi-run --workloads stream,fio \\
+                --configs single_core,full_socket --dry-run
+        """),
+    )
+    p_mr.add_argument(
+        "--workloads", required=True, metavar="NAME,NAME,...",
+        help="Comma-separated workload names (see list-workloads)",
+    )
+    p_mr.add_argument(
+        "--configs", metavar="PRESET,PRESET,...",
+        help="Comma-separated config preset names (e.g. single_core,full_socket,4c4t); "
+             "see list-configs for all options on this machine",
+    )
+    p_mr.add_argument(
+        "--threads", metavar="N,N,...",
+        help="Comma-separated thread counts instead of named presets (e.g. 1,4,8,16)",
+    )
+    p_mr.add_argument(
+        "--iterations", type=int, default=1, metavar="N",
+        help="Iterations per (workload, config) combination (default: 1)",
+    )
+    p_mr.add_argument(
+        "--arg", nargs="*", metavar="key=value",
+        help="Workload-specific arguments applied to every run, e.g. --arg time=30",
+    )
+    p_mr.add_argument("--dry-run", action="store_true", help="Print commands without executing")
+    p_mr.add_argument("--verbose", action="store_true", help="Print per-iteration results")
+    p_mr.add_argument(
+        "--stop-on-error", action="store_true",
+        help="Abort the matrix after the first failed combination",
     )
 
     # scaling
@@ -2384,6 +2622,7 @@ def main():
         "list-configs": cmd_list_configs,
         "validate": cmd_validate,
         "run": cmd_run,
+        "multi-run": cmd_multi_run,
         "scaling": cmd_scaling,
         "report": cmd_report,
         "cloud-run": cmd_cloud_run,
