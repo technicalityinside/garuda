@@ -147,6 +147,16 @@ def _configure_kernel(src_dir: str) -> Tuple[bool, str]:
     r = subprocess.run(["make", "olddefconfig"], cwd=src_dir, timeout=300)
     if r.returncode != 0:
         return False, "make olddefconfig failed"
+
+    # Clear distro-specific cert paths that don't exist in mainline trees.
+    # Ubuntu sets these to "debian/canonical-certs.pem" etc.; keeping them
+    # causes "No rule to make target" errors when building mainline source.
+    for key in ("SYSTEM_TRUSTED_KEYS", "SYSTEM_REVOCATION_KEYS"):
+        subprocess.run(
+            ["scripts/config", "--set-str", key, ""],
+            cwd=src_dir, timeout=30,
+        )
+
     return True, "Kernel config prepared"
 
 
