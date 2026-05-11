@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import sys
 import tarfile
 import urllib.request
 from typing import List, Optional, Tuple
@@ -193,14 +194,47 @@ def _build_and_install(src_dir: str) -> Tuple[bool, str, str]:
         return False, msg, ""
 
     nproc = os.cpu_count() or 1
-    print(f"    make -j{nproc} bindeb-pkg  (this may take 30–90 min) ...")
-    r = subprocess.run(
-        ["make", f"-j{nproc}", "bindeb-pkg", "LOCALVERSION="],
-        cwd=src_dir,
-        timeout=7200,
-    )
-    if r.returncode != 0:
-        return False, "make bindeb-pkg failed", ""
+    log_path = os.path.join(os.path.dirname(src_dir), "build.log")
+    print(f"    make -j{nproc} bindeb-pkg  (this may take 30–90 min) ...", flush=True)
+    print(f"    Full build log: {log_path}", flush=True)
+
+    returncode = None
+    try:
+        with open(log_path, "wb") as log_f:
+            proc = subprocess.Popen(
+                ["make", f"-j{nproc}", "bindeb-pkg", "LOCALVERSION="],
+                cwd=src_dir,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+            )
+            for chunk in iter(lambda: proc.stdout.read(4096), b""):
+                sys.stdout.buffer.write(chunk)
+                sys.stdout.buffer.flush()
+                log_f.write(chunk)
+            proc.wait(timeout=7200)
+            returncode = proc.returncode
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        return False, "make bindeb-pkg timed out after 2 hours", ""
+
+    if returncode != 0:
+        # Extract the actual compiler/linker error lines and show them
+        try:
+            with open(log_path) as f:
+                lines = f.readlines()
+            error_lines = [
+                l.rstrip() for l in lines
+                if re.search(r'\berror:', l, re.IGNORECASE)
+                and not re.search(r'\bwarning:.*error:', l, re.IGNORECASE)
+            ]
+            if error_lines:
+                print(f"\n    ── Build errors ({len(error_lines)} found, last 15) ──")
+                for l in error_lines[-15:]:
+                    print(f"    {l}")
+                print(f"    ── Full log: {log_path} ──\n")
+        except Exception:
+            pass
+        return False, f"make bindeb-pkg failed — see {log_path}", ""
 
     # .deb files land in the parent of the source tree
     parent = os.path.dirname(src_dir)
