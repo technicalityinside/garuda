@@ -83,7 +83,9 @@ class FsMark(BaseWorkload):
             "iterations":  5,        # -L: number of create-sync-delete cycles
             "dir":         "",       # -d: working directory (default: work_dir subdir)
             "subdirs":     0,        # -D: number of subdirectories (0 = flat)
-            "sync_writes": True,     # -S: fsync each file after write
+            # -S sync method: 0=none 1=fsyncBeforeClose 2=sync+fsync
+            # 3=PostReverseFsync 4=syncPostReverseFsync 5=PostFsync 6=syncPostFsync
+            "sync_method": 1,
         }
 
     @property
@@ -135,37 +137,74 @@ class FsMark(BaseWorkload):
         ]
         if int(cfg.get("subdirs", 0)) > 0:
             cmd += ["-D", str(int(cfg["subdirs"]))]
-        if cfg.get("sync_writes"):
-            cmd.append("-S")
+        # -S requires a method argument in the source-built version (0–6)
+        sync = int(cfg.get("sync_method", cfg.get("sync_writes", 1) and 1 or 0))
+        cmd += ["-S", str(sync)]
         return cmd
 
     def parse_output(self, stdout: str, stderr: str, returncode: int) -> Dict[str, float]:
         """
-        Parse fs_mark output.  The tool prints one result line per iteration
-        plus a final average block, e.g.:
+        Handle two output formats depending on fs_mark version:
 
-          #  File Size  Dir Size  #Threads  #SubDirs  #Files  Time(sec)  Files/sec ...
-          1     4096       0         4         0       4096      2.34      1750.4   ...
-          ...
+        v3.3+ (source build):
+          FSUse%  Count  Size  Files/sec  App Overhead
+              20   4096  4096      749.3         16792
+          Average Files/sec:        762.4
+          p50 Files/sec: 759
+          p90 Files/sec: 749
+          p99 Files/sec: 749
+
+        Older (packaged):
           Average File Creation Results:
-          Threads  File Size  Files/sec   App Overhead
-              4       4096    1812.3         0.00
-
-        Report the average files/sec from the summary block.
+          Threads  File Size  Files/sec  App Overhead
+              4       4096    1812.3        0.00
+          Per-iteration: "1  4096  0  4  0  4096  2.34  1750.4  ..."
         """
         metrics: Dict[str, float] = {}
+        per_iter_v33: List[float] = []    # v3.3 Files/sec column (col 3)
+        per_iter_old: List[float] = []    # old format Files/sec column (col 7)
         in_avg_block = False
-        per_iter_values: List[float] = []
+        in_v33_table = False
 
         for line in stdout.splitlines():
             s = line.strip()
+            if not s:
+                continue
 
+            # ── v3.3 summary lines ────────────────────────────────────────────
+            m = re.match(r'Average\s+Files/sec:\s+([\d.]+)', s)
+            if m:
+                metrics["files_per_sec"] = float(m.group(1))
+                continue
+
+            m = re.match(r'p(\d+)\s+Files/sec:\s+([\d.]+)', s)
+            if m:
+                metrics[f"files_per_sec_p{m.group(1)}"] = float(m.group(2))
+                continue
+
+            # ── v3.3 table header ─────────────────────────────────────────────
+            if s.startswith("FSUse%"):
+                in_v33_table = True
+                in_avg_block = False
+                continue
+
+            # ── v3.3 data row: "20  4096  4096  749.3  16792"
+            if in_v33_table and s and s[0].isdigit():
+                parts = s.split()
+                if len(parts) >= 4:
+                    try:
+                        per_iter_v33.append(float(parts[3]))
+                    except ValueError:
+                        pass
+                continue
+
+            # ── old format average block ──────────────────────────────────────
             if "Average File Creation" in s:
                 in_avg_block = True
+                in_v33_table = False
                 continue
 
             if in_avg_block:
-                # "    4       4096    1812.3    0.00"
                 parts = s.split()
                 if len(parts) >= 3:
                     try:
@@ -175,18 +214,19 @@ class FsMark(BaseWorkload):
                 in_avg_block = False
                 continue
 
-            # Also parse per-iteration lines: "1  4096  0  4  0  4096  2.34  1750.4  ..."
-            # Column 8 (0-indexed 7) is Files/sec — skip header lines
-            if s and s[0].isdigit():
+            # ── old format per-iteration: col 7 is Files/sec ─────────────────
+            if not in_v33_table and s and s[0].isdigit():
                 parts = s.split()
                 if len(parts) >= 8:
                     try:
-                        per_iter_values.append(float(parts[7]))
+                        per_iter_old.append(float(parts[7]))
                     except ValueError:
                         pass
 
-        # Fall back to mean of per-iteration values if average block was not found
-        if "files_per_sec" not in metrics and per_iter_values:
-            metrics["files_per_sec"] = sum(per_iter_values) / len(per_iter_values)
+        # Fallback: derive average from per-iteration values if no summary line
+        if "files_per_sec" not in metrics:
+            pool = per_iter_v33 or per_iter_old
+            if pool:
+                metrics["files_per_sec"] = sum(pool) / len(pool)
 
         return metrics
