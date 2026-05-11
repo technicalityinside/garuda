@@ -14,7 +14,9 @@ Requirements
 import os
 import re
 import shutil
+import subprocess
 import sys
+import tempfile
 from typing import Dict, List, Tuple
 
 _here = os.path.dirname(os.path.abspath(__file__))
@@ -51,7 +53,51 @@ class SchBench(BaseWorkload):
     def install(self, install_dir: str, force: bool = False) -> Tuple[bool, str]:
         if not force and shutil.which("schbench"):
             return True, f"Already installed: {shutil.which('schbench')}"
-        return PackageInstaller.ensure_tools(("schbench", "schbench"))
+
+        # Try package manager first (available on some distros)
+        ok, msg = PackageInstaller.ensure_tools(("schbench", "schbench"))
+        if ok:
+            return True, msg
+
+        # Package not in repos — build from source (single C file, no extra deps)
+        print("  Package not available in repos — building schbench from source...")
+        return _build_schbench(install_dir)
+
+
+def _build_schbench(install_dir: str) -> Tuple[bool, str]:
+    ok, msg = PackageInstaller.ensure_tools(("gcc", "gcc"), ("make", "make"), ("git", "git"))
+    if not ok:
+        return False, f"Build deps unavailable: {msg}"
+
+    tmpdir = tempfile.mkdtemp(prefix="schbench_src_")
+    try:
+        urls = [
+            "https://git.kernel.org/pub/scm/linux/kernel/git/mason/schbench.git",
+            "https://github.com/kernel-patches/schbench.git",
+        ]
+        src_dir = os.path.join(tmpdir, "src")
+        cloned = False
+        for url in urls:
+            r = subprocess.run(
+                ["git", "clone", "--depth=1", url, src_dir],
+                capture_output=True, text=True,
+            )
+            if r.returncode == 0:
+                cloned = True
+                break
+        if not cloned:
+            return False, "git clone failed for all schbench mirror URLs"
+
+        r = subprocess.run(["make"], cwd=src_dir, capture_output=True, text=True)
+        if r.returncode != 0:
+            return False, f"make failed:\n{r.stderr.strip()}"
+
+        dest = os.path.join(install_dir, "schbench")
+        shutil.copy2(os.path.join(src_dir, "schbench"), dest)
+        os.chmod(dest, 0o755)
+        return True, f"Built from source and installed: {dest}"
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
     def build_command(self, config: BenchmarkConfig) -> List[str]:
         cfg = {**self.default_workload_args(), **config.workload_args}

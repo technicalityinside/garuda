@@ -31,6 +31,10 @@ _LMBENCH_PATHS = [
     "/usr/lib/lmbench/bin/lat_mem_rd",
     "/usr/lib/x86_64-linux-gnu/lmbench/bin/lat_mem_rd",
     "/usr/lib/aarch64-linux-gnu/lmbench/bin/lat_mem_rd",
+    # Ubuntu places the binary under an arch-specific sub-directory of bin/
+    "/usr/lib/lmbench/bin/x86_64-linux-gnu/lat_mem_rd",
+    "/usr/lib/lmbench/bin/aarch64-linux-gnu/lat_mem_rd",
+    "/usr/lib/lmbench/bin/riscv64-linux-gnu/lat_mem_rd",
 ]
 
 # Representative sizes (MB) and their metric label
@@ -50,6 +54,15 @@ def _find_lat_mem_rd() -> Optional[str]:
     for candidate in _LMBENCH_PATHS:
         if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
             return candidate
+    # Last resort: glob for any arch sub-directory Ubuntu may have used
+    import glob
+    for pat in (
+        "/usr/lib/lmbench/bin/*/lat_mem_rd",
+        "/usr/lib/*/lmbench/bin/lat_mem_rd",
+    ):
+        for m in sorted(glob.glob(pat)):
+            if os.path.isfile(m) and os.access(m, os.X_OK):
+                return m
     return None
 
 
@@ -90,13 +103,15 @@ class MemLat(BaseWorkload):
     def install(self, install_dir: str, force: bool = False) -> Tuple[bool, str]:
         if not force and _find_lat_mem_rd():
             return True, f"Already installed: {_find_lat_mem_rd()}"
-        ok, msg = PackageInstaller.ensure_tools(("lmbench", "lmbench"))
-        if ok:
-            p = _find_lat_mem_rd()
-            if p:
-                return True, f"Installed; binary at {p}"
-            return False, "lmbench installed but lat_mem_rd not found — check /usr/lib/lmbench/bin/"
-        return ok, msg
+        # lat_mem_rd is not in PATH after install, so we can't use ensure_tools
+        # (which verifies the binary name in PATH). Install the package directly.
+        ok, msg = PackageInstaller.install("lmbench")
+        if not ok:
+            return False, msg
+        p = _find_lat_mem_rd()
+        if p:
+            return True, f"Installed; binary at {p}"
+        return False, "lmbench installed but lat_mem_rd not found — check /usr/lib/lmbench/bin/"
 
     def setup(self, config: BenchmarkConfig, work_dir: str) -> None:
         self._binary = _find_lat_mem_rd()

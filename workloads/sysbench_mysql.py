@@ -142,7 +142,32 @@ class SysbenchMySQL(BaseWorkload):
                 "sysbench installed but Docker Engine is not present.\n"
                 "Install it from https://docs.docker.com/engine/install/"
             )
-        return True, f"sysbench installed; Docker present"
+
+        # Verify daemon is reachable; try to start it if not
+        r = subprocess.run(["docker", "info"], capture_output=True)
+        if r.returncode != 0:
+            print("  Docker daemon not running — attempting to start it...")
+            daemon_up = False
+            for start_cmd in (
+                ["sudo", "systemctl", "start", "docker"],
+                ["sudo", "snap",      "start", "docker"],
+                ["sudo", "service",   "docker", "start"],
+            ):
+                if not shutil.which(start_cmd[1]):
+                    continue
+                subprocess.run(start_cmd, capture_output=True)
+                time.sleep(3)
+                if subprocess.run(["docker", "info"], capture_output=True).returncode == 0:
+                    daemon_up = True
+                    break
+            if not daemon_up:
+                return False, (
+                    "Docker daemon is not running and could not be started automatically.\n"
+                    "Run:  sudo systemctl start docker\n"
+                    "  or: sudo snap start docker"
+                )
+
+        return True, "sysbench and Docker daemon ready"
 
     # ── Internal helpers ───────────────────────────────────────────────────────
 
