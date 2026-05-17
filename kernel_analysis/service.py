@@ -47,17 +47,24 @@ WantedBy=multi-user.target
 
 def remove_service() -> None:
     """Disable and delete the resume service (called when analysis completes or aborts)."""
-    try:
-        subprocess.run(
-            ["systemctl", "disable", "--now", SERVICE_NAME],
-            capture_output=True, timeout=15,
-        )
-    except Exception:
-        pass
+    # Delete the unit file first so daemon-reload makes the unit fully disappear.
+    # Do NOT use `systemctl disable --now` here: `--now` sends SIGTERM to the
+    # calling process when remove_service() is invoked from within the service
+    # itself, killing us before the file can be removed.
     try:
         if os.path.exists(SERVICE_FILE):
             os.remove(SERVICE_FILE)
+    except Exception:
+        pass
+    try:
         subprocess.run(["systemctl", "daemon-reload"], capture_output=True, timeout=15)
+    except Exception:
+        pass
+    try:
+        subprocess.run(
+            ["systemctl", "disable", SERVICE_NAME],
+            capture_output=True, timeout=15,
+        )
     except Exception:
         pass
 
