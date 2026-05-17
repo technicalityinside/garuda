@@ -274,10 +274,14 @@ def _build_and_install(src_dir: str) -> Tuple[bool, str, str]:
 
 def install_from_github(source_spec: dict,
                         build_base: str = _DEFAULT_BUILD_BASE) -> Tuple[bool, str, str]:
-    """Clone a GitHub repo at a branch and build+install the kernel."""
+    """Clone a GitHub repo at a branch/tag and build+install the kernel."""
     repo = source_spec["repo"]
     branch = source_spec["branch"]
     label = source_spec.get("label") or branch
+
+    # When a @label (e.g. @v7.0) is specified, use it as the git ref so that
+    # tags are checked out rather than just treated as display names.
+    ref = label if label != branch else branch
 
     clone_dir = os.path.join(build_base, f"linux-github-{re.sub(r'[^A-Za-z0-9._-]', '_', label)}")
     os.makedirs(build_base, exist_ok=True)
@@ -285,13 +289,13 @@ def install_from_github(source_spec: dict,
     if os.path.isdir(clone_dir):
         print(f"    Reusing existing clone at {clone_dir}")
     else:
-        print(f"    git clone --depth=1 -b {branch} {repo} ...")
+        print(f"    git clone --depth=1 -b {ref} {repo} ...")
         r = subprocess.run(
-            ["git", "clone", "--depth=1", "-b", branch, repo, clone_dir],
+            ["git", "clone", "--depth=1", "-b", ref, repo, clone_dir],
             timeout=1800,
         )
         if r.returncode != 0:
-            return False, f"git clone failed for {repo}@{branch}", ""
+            return False, f"git clone failed for {repo}@{ref}", ""
 
     ok, msg = _configure_kernel(clone_dir)
     if not ok:
